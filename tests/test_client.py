@@ -19,6 +19,10 @@ from grexie_signals_client import (
 )
 
 
+def order_budget_cost(order):
+    return abs(order.size_delta) + max(order.estimated_fee, 0.0)
+
+
 class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_events_fan_out_to_independent_consumers(self):
         client = SignalsClient("")
@@ -75,7 +79,7 @@ class ClientTests(unittest.TestCase):
         )
         self.assertEqual(len(buy), 1)
         self.assertEqual(buy[0].reason, "opening")
-        self.assertAlmostEqual(buy[0].target_size, 0.10)
+        self.assertAlmostEqual(order_budget_cost(buy[0]), 0.10)
 
         sell = manager.handle_signal(
             Signal("okx", "BTC-USDT-SWAP", 0.9, "sell", 0.02, 0.004, price=99.0, score=-0.6)
@@ -84,7 +88,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(sell[0].side, "sell")
         self.assertEqual(sell[0].reason, "flip")
         self.assertAlmostEqual(sell[0].target_size, 0.0)
-        self.assertAlmostEqual(sell[0].size_delta, -0.10)
+        self.assertAlmostEqual(sell[0].size_delta, -buy[0].target_size)
 
         open_short = manager.handle_signal(
             Signal("okx", "BTC-USDT-SWAP", 0.9, "sell", 0.02, 0.004, price=99.0, score=-0.6)
@@ -93,7 +97,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(open_short[0].side, "sell")
         self.assertEqual(open_short[0].reason, "opening")
 
-    def test_min_delta_scales_to_position_size(self):
+    def test_confidence_is_allocation_weight(self):
         manager = PositionManager(
             config=production_position_manager_config(
                 position_size=0.10,
@@ -102,14 +106,35 @@ class ClientTests(unittest.TestCase):
             )
         )
         manager.instruments.update_instrument(InstrumentMetadata("okx", "DOGE-USDT-SWAP"))
-        rejected = manager.handle_signal(
+        accepted = manager.handle_signal(
             Signal("okx", "DOGE-USDT-SWAP", 0.15, "buy", 0.02, 0.004, price=0.2)
         )
-        accepted = manager.handle_signal(
-            Signal("okx", "DOGE-USDT-SWAP", 0.25, "buy", 0.02, 0.004, price=0.2)
-        )
-        self.assertEqual(rejected, [])
         self.assertEqual(len(accepted), 1)
+        self.assertAlmostEqual(order_budget_cost(accepted[0]), 0.10)
+
+    def test_quantizes_emitted_target_size_to_executable_lots(self):
+        assets = AssetManager()
+        assets.update_asset(AssetSnapshot("USDT", equity=1000, available=1000))
+        instruments = InstrumentManager()
+        instruments.update_instrument(
+            InstrumentMetadata("okx", "BTC-USDT-SWAP", "USDT", lot_size=1, min_size=1, tick_size=0.1)
+        )
+        manager = PositionManager(
+            config=production_position_manager_config(
+                position_size=0.50,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+                asset_manager=assets,
+                instrument_manager=instruments,
+            )
+        )
+        orders = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.15, "buy", 0.02, 0.004, price=333)
+        )
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0].quantity, 1)
+        self.assertAlmostEqual(orders[0].size_delta, 0.333)
+        self.assertAlmostEqual(orders[0].target_size, 0.333)
 
     def test_ignores_unconfigured_signals(self):
         manager = PositionManager(
@@ -247,7 +272,8 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(reductions), 1)
         self.assertEqual(reductions[0].instrument, "BTC-USDT-SWAP")
         self.assertEqual(reductions[0].side, "sell")
-        self.assertAlmostEqual(reductions[0].target_size, 0.10)
+        expected_btc_target = 0.10 / (1 + reductions[0].leverage * reductions[0].fee_rate)
+        self.assertAlmostEqual(reductions[0].target_size, expected_btc_target)
 
         openings = manager.handle_signal(
             Signal("okx", "ETH-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
@@ -274,8 +300,8 @@ class ClientTests(unittest.TestCase):
             Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
         )
         self.assertEqual(len(orders), 1)
-        self.assertAlmostEqual(orders[0].size_delta, 0.05)
-        self.assertAlmostEqual(orders[0].target_size, 0.05)
+        self.assertLessEqual(order_budget_cost(orders[0]), 0.05 + 1e-9)
+        self.assertLess(orders[0].size_delta, 0.05)
 
     def test_stats_by_instrument_and_currency(self):
         assets = AssetManager()
