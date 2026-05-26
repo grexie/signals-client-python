@@ -30,6 +30,7 @@ asyncio.run(main())
 
 ```python
 from grexie_signals_client import (
+    InstrumentMetadata,
     PositionManager,
     Signal,
     production_position_manager_config,
@@ -45,6 +46,9 @@ manager = PositionManager(
         max_leverage=3.0,
     )
 )
+manager.instruments.update_instrument(
+    InstrumentMetadata("okx", "BTC-USDT-SWAP", settlement_currency="USDT")
+)
 
 orders = manager.handle_signal(
     Signal("okx", "BTC-USDT-SWAP", 0.82, "buy", 0.012, 0.004, price=68000)
@@ -52,6 +56,8 @@ orders = manager.handle_signal(
 ```
 
 The manager mirrors the server sizing behavior: total portfolio budget is shared by confidence weight, `min_order_delta` scales by `position_size`, same-side churn can be suppressed, opposite-side flips are allowed, fees feed realized PnL, and leverage is selected from confidence, fee-adjusted edge, and score.
+
+`PositionManager` ignores replay signal events and ignores live signals whose venue/instrument pair has not been configured in its `InstrumentManager`. `SignalsClient.events()` fans out events to independent consumers, so multiple position managers can share one client.
 
 Use `add_position`, `update_position`, and `close_position` to hydrate or mutate the runtime from an exchange account.
 

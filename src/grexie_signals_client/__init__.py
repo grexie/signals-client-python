@@ -11,6 +11,7 @@ The package exposes two primary objects:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 from dataclasses import dataclass, field, replace
@@ -176,6 +177,11 @@ class SignalsClient:
         self.url = url
         self.headers = dict(headers or {})
         self.websocket: Any = None
+        self._receive_queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._subscriber_queues: List[asyncio.Queue[Any]] = []
+        self._reader_task: Optional[asyncio.Task[None]] = None
+        self._closed = False
+        self._terminal_error: Optional[BaseException] = None
 
     async def connect(self) -> None:
         """Open the websocket connection."""
@@ -186,10 +192,18 @@ class SignalsClient:
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         self.websocket = await websockets.connect(self.url, extra_headers=headers)
+        self._closed = False
+        self._terminal_error = None
+        self._reader_task = asyncio.create_task(self._read_loop())
 
     async def close(self) -> None:
         """Close the websocket connection."""
 
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reader_task
+            self._reader_task = None
         if self.websocket is not None:
             await self.websocket.close()
             self.websocket = None
@@ -212,20 +226,60 @@ class SignalsClient:
     async def receive(self) -> SignalsEvent:
         """Receive the next typed event."""
 
-        if self.websocket is None:
+        if self.websocket is None and self._reader_task is None:
             raise RuntimeError("signals client is not connected")
-        return parse_event(await self.websocket.recv())
+        if self._closed and self._receive_queue.empty():
+            raise RuntimeError("signals client is closed")
+        item = await self._receive_queue.get()
+        if item is None:
+            raise RuntimeError("signals client is closed")
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
     async def events(self) -> AsyncIterator[SignalsEvent]:
         """Yield events until the websocket closes."""
 
-        while True:
-            yield await self.receive()
+        if self._terminal_error is not None:
+            raise self._terminal_error
+        if self._closed:
+            return
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._subscriber_queues.append(queue)
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            with contextlib.suppress(ValueError):
+                self._subscriber_queues.remove(queue)
 
     async def _send(self, payload: Dict[str, Any]) -> None:
         if self.websocket is None:
             raise RuntimeError("signals client is not connected")
         await self.websocket.send(json.dumps(payload, separators=(",", ":")))
+
+    async def _read_loop(self) -> None:
+        try:
+            while self.websocket is not None:
+                await self._publish(parse_event(await self.websocket.recv()))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._terminal_error = exc
+            await self._publish(exc)
+        finally:
+            self._closed = True
+            await self._publish(None)
+
+    async def _publish(self, item: Any) -> None:
+        await self._receive_queue.put(item)
+        for queue in list(self._subscriber_queues):
+            await queue.put(item)
 
 
 @dataclass
@@ -286,6 +340,9 @@ class InstrumentManager:
 
     def instrument(self, venue: str, instrument: str) -> InstrumentMetadata:
         return self._instruments.get(_position_key(venue, instrument), InstrumentMetadata(venue, instrument))
+
+    def has_instrument(self, venue: str, instrument: str) -> bool:
+        return _position_key(venue, instrument) in self._instruments
 
     def instruments(self) -> List[InstrumentMetadata]:
         return [self._instruments[key] for key in sorted(self._instruments)]
@@ -531,6 +588,8 @@ class PositionManager:
     def handle_event(self, event: SignalsEvent) -> List[Order]:
         if not isinstance(event, SignalEvent):
             return []
+        if event.replay:
+            return []
         orders = self.handle_signal(event.signal)
         for order in orders:
             order.subscription_id = event.subscription_id
@@ -538,6 +597,10 @@ class PositionManager:
         return orders
 
     def handle_signal(self, signal: Signal) -> List[Order]:
+        if not signal.venue or not signal.instrument:
+            return []
+        if not self.instruments.has_instrument(signal.venue, signal.instrument):
+            return []
         key = _position_key(signal.venue, signal.instrument)
         target_sign = _side_sign(signal.side)
         target_confidence = _clamp01(signal.confidence)

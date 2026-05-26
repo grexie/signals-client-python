@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from grexie_signals_client import (
@@ -7,13 +8,33 @@ from grexie_signals_client import (
     InstrumentMetadata,
     PositionManager,
     Position,
+    ReadyEvent,
     Signal,
+    SignalsClient,
     SignalEvent,
     InfoEvent,
     ErrorEvent,
     parse_event,
     production_position_manager_config,
 )
+
+
+class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_events_fan_out_to_independent_consumers(self):
+        client = SignalsClient("")
+        first = client.events()
+        second = client.events()
+        first_event = asyncio.create_task(first.__anext__())
+        second_event = asyncio.create_task(second.__anext__())
+        while len(client._subscriber_queues) < 2:
+            await asyncio.sleep(0)
+
+        await client._publish(ReadyEvent("ready", "ok"))
+
+        self.assertEqual((await first_event).type, "ready")
+        self.assertEqual((await second_event).type, "ready")
+        await first.aclose()
+        await second.aclose()
 
 
 class ClientTests(unittest.TestCase):
@@ -48,6 +69,7 @@ class ClientTests(unittest.TestCase):
                 max_leverage=5.0,
             )
         )
+        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
         buy = manager.handle_signal(
             Signal("okx", "BTC-USDT-SWAP", 0.8, "buy", 0.02, 0.004, price=100.0, score=0.5)
         )
@@ -71,6 +93,7 @@ class ClientTests(unittest.TestCase):
                 min_order_delta=0.20,
             )
         )
+        manager.instruments.update_instrument(InstrumentMetadata("okx", "DOGE-USDT-SWAP"))
         rejected = manager.handle_signal(
             Signal("okx", "DOGE-USDT-SWAP", 0.15, "buy", 0.02, 0.004, price=0.2)
         )
@@ -79,6 +102,68 @@ class ClientTests(unittest.TestCase):
         )
         self.assertEqual(rejected, [])
         self.assertEqual(len(accepted), 1)
+
+    def test_ignores_unconfigured_signals(self):
+        manager = PositionManager(
+            config=production_position_manager_config(
+                position_size=0.10,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+            )
+        )
+        signal = Signal("okx", "SOL-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
+        self.assertEqual(manager.handle_signal(signal), [])
+        self.assertEqual(manager.positions(), [])
+
+        manager.instruments.update_instrument(InstrumentMetadata("okx", "SOL-USDT-SWAP"))
+        self.assertEqual(len(manager.handle_signal(signal)), 1)
+
+    def test_ignores_replay_signal_events(self):
+        manager = PositionManager(
+            config=production_position_manager_config(
+                position_size=0.10,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+            )
+        )
+        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
+        event = SignalEvent(
+            "signal",
+            3,
+            "okx",
+            "BTC-USDT-SWAP",
+            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100),
+            replay=True,
+        )
+        self.assertEqual(manager.handle_event(event), [])
+        self.assertEqual(manager.positions(), [])
+        event.replay = False
+        self.assertEqual(len(manager.handle_event(event)), 1)
+
+    def test_leverage_adapts_by_confidence_edge_and_score_within_caps(self):
+        def leverage_for(instrument: str, confidence: float, take_profit: float, score: float) -> float:
+            manager = PositionManager(
+                config=production_position_manager_config(
+                    position_size=1.0,
+                    min_expected_edge=0.0,
+                    min_order_delta=0.0,
+                    min_leverage=1.0,
+                    max_leverage=5.0,
+                )
+            )
+            manager.instruments.update_instrument(InstrumentMetadata("okx", instrument))
+            orders = manager.handle_signal(
+                Signal("okx", instrument, confidence, "buy", take_profit, 0.0, score=score, price=100)
+            )
+            return orders[0].leverage
+
+        low = leverage_for("LOW-USDT-SWAP", 0.2, 0.0, 0.0)
+        scored = leverage_for("SCORE-USDT-SWAP", 0.2, 0.0, 1.0)
+        high = leverage_for("HIGH-USDT-SWAP", 1.0, 0.02, 1.0)
+        self.assertGreaterEqual(low, 1.0)
+        self.assertLessEqual(high, 5.0)
+        self.assertGreater(scored, low)
+        self.assertAlmostEqual(high, 5.0)
 
     def test_asset_and_instrument_managers_create_concrete_orders(self):
         assets = AssetManager()
