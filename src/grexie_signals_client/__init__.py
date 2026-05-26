@@ -16,7 +16,7 @@ import json
 import math
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Dict, Iterable, List, Literal, Optional, Union
+from typing import Any, AsyncIterator, Dict, Iterable, List, Literal, Optional, Protocol, Union
 
 SignalsWebSocketToken = str
 Side = Literal["buy", "sell"]
@@ -49,6 +49,26 @@ class Signal:
     timeframe: Optional[str] = None
     score: float = 0.0
     components: List[SignalComponent] = field(default_factory=list)
+    model_variant: Optional[str] = None
+    model_version: Optional[str] = None
+    prediction_mode: Optional[str] = None
+    confidence_mapping: Optional[str] = None
+    up_probability: float = 0.0
+    down_probability: float = 0.0
+    directional_edge: float = 0.0
+    normalized_edge: float = 0.0
+    expected_value: float = 0.0
+    regime: Optional[str] = None
+    regime_confidence: float = 0.0
+    volatility_state: Optional[str] = None
+    squeeze_state: Optional[str] = None
+    trend_state: Optional[str] = None
+    atr_percent: float = 0.0
+    signal_ttl: float = 0.0
+    generated_at: Optional[datetime] = None
+    artifact_id: Optional[str] = None
+    artifact_version: Optional[str] = None
+    rejected_reason: Optional[str] = None
     timestamp: Optional[datetime] = None
     price: float = 0.0
 
@@ -282,6 +302,13 @@ class SignalsClient:
             await queue.put(item)
 
 
+class SignalEventSource(Protocol):
+    """Narrow async event stream consumed by PositionManager."""
+
+    def events(self) -> AsyncIterator[SignalsEvent]:
+        ...
+
+
 @dataclass
 class InstrumentConfig:
     maker_fee_rate: Optional[float] = None
@@ -424,6 +451,7 @@ class Order:
     score: float = 0.0
     take_profit: float = 0.0
     stop_loss: float = 0.0
+    reduce_only: bool = False
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     subscription_id: Optional[int] = None
     replay: bool = False
@@ -509,7 +537,7 @@ class _ExecutableAllocation:
 class PositionManager:
     """In-memory, fee-aware production-style position manager."""
 
-    def __init__(self, client: Optional[SignalsClient] = None, config: Optional[PositionManagerConfig] = None) -> None:
+    def __init__(self, client: Optional[SignalEventSource] = None, config: Optional[PositionManagerConfig] = None) -> None:
         self.client = client
         self.config = _normalize_config(config or production_position_manager_config())
         self.assets = self.config.asset_manager or AssetManager()
@@ -942,6 +970,7 @@ class PositionManager:
             min_size=metadata.min_size,
             lot_size=metadata.lot_size,
             tick_size=metadata.tick_size,
+            reduce_only=_is_exposure_reduction(position.size, position.size + executable_delta),
         )
 
     def _apply_delta(self, key: str, delta: float, price: float, fee_rate: float) -> None:
@@ -1035,6 +1064,26 @@ def _signal_from_payload(payload: Dict[str, Any]) -> Signal:
         stop_loss=float(payload.get("stopLoss", payload.get("stop_loss", 0.0))),
         score=float(payload.get("score", 0.0)),
         components=[],
+        model_variant=payload.get("modelVariant", payload.get("model_variant")),
+        model_version=payload.get("modelVersion", payload.get("model_version")),
+        prediction_mode=payload.get("predictionMode", payload.get("prediction_mode")),
+        confidence_mapping=payload.get("confidenceMapping", payload.get("confidence_mapping")),
+        up_probability=float(payload.get("upProbability", payload.get("up_probability", 0.0)) or 0.0),
+        down_probability=float(payload.get("downProbability", payload.get("down_probability", 0.0)) or 0.0),
+        directional_edge=float(payload.get("directionalEdge", payload.get("directional_edge", 0.0)) or 0.0),
+        normalized_edge=float(payload.get("normalizedEdge", payload.get("normalized_edge", 0.0)) or 0.0),
+        expected_value=float(payload.get("expectedValue", payload.get("expected_value", 0.0)) or 0.0),
+        regime=payload.get("regime"),
+        regime_confidence=float(payload.get("regimeConfidence", payload.get("regime_confidence", 0.0)) or 0.0),
+        volatility_state=payload.get("volatilityState", payload.get("volatility_state")),
+        squeeze_state=payload.get("squeezeState", payload.get("squeeze_state")),
+        trend_state=payload.get("trendState", payload.get("trend_state")),
+        atr_percent=float(payload.get("atrPercent", payload.get("atr_percent", 0.0)) or 0.0),
+        signal_ttl=float(payload.get("signalTTL", payload.get("signal_ttl", 0.0)) or 0.0),
+        generated_at=_parse_time(payload.get("generatedAt", payload.get("generated_at"))),
+        artifact_id=payload.get("artifactID", payload.get("artifact_id")),
+        artifact_version=payload.get("artifactVersion", payload.get("artifact_version")),
+        rejected_reason=payload.get("rejectedReason", payload.get("rejected_reason")),
         timestamp=_parse_time(payload.get("timestamp")),
         price=float(payload.get("price", 0.0) or 0.0),
     )
@@ -1173,6 +1222,7 @@ __all__ = [
     "SignalEvent",
     "ErrorEvent",
     "SignalsEvent",
+    "SignalEventSource",
     "SignalsClient",
     "PositionManager",
     "PositionManagerConfig",
