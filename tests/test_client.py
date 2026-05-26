@@ -83,7 +83,15 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(sell), 1)
         self.assertEqual(sell[0].side, "sell")
         self.assertEqual(sell[0].reason, "flip")
-        self.assertLess(sell[0].size_delta, -0.19)
+        self.assertAlmostEqual(sell[0].target_size, 0.0)
+        self.assertAlmostEqual(sell[0].size_delta, -0.10)
+
+        open_short = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.9, "sell", 0.02, 0.004, price=99.0, score=-0.6)
+        )
+        self.assertEqual(len(open_short), 1)
+        self.assertEqual(open_short[0].side, "sell")
+        self.assertEqual(open_short[0].reason, "opening")
 
     def test_min_delta_scales_to_position_size(self):
         manager = PositionManager(
@@ -214,6 +222,60 @@ class ClientTests(unittest.TestCase):
             Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
         )
         self.assertEqual(orders, [])
+
+    def test_phases_reductions_before_openings(self):
+        assets = AssetManager()
+        assets.update_asset(AssetSnapshot("USDT", cash=1000, available=1000, equity=1000))
+        instruments = InstrumentManager()
+        instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP", "USDT"))
+        instruments.update_instrument(InstrumentMetadata("okx", "ETH-USDT-SWAP", "USDT"))
+        manager = PositionManager(
+            config=production_position_manager_config(
+                position_size=0.20,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+                asset_manager=assets,
+                instrument_manager=instruments,
+            )
+        )
+        manager.add_position(
+            Position("okx", "BTC-USDT-SWAP", size=0.15, confidence=1.0, entry_price=100, last_price=100)
+        )
+        reductions = manager.handle_signal(
+            Signal("okx", "ETH-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
+        )
+        self.assertEqual(len(reductions), 1)
+        self.assertEqual(reductions[0].instrument, "BTC-USDT-SWAP")
+        self.assertEqual(reductions[0].side, "sell")
+        self.assertAlmostEqual(reductions[0].target_size, 0.10)
+
+        openings = manager.handle_signal(
+            Signal("okx", "ETH-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
+        )
+        self.assertEqual(len(openings), 1)
+        self.assertEqual(openings[0].instrument, "ETH-USDT-SWAP")
+        self.assertEqual(openings[0].side, "buy")
+
+    def test_caps_openings_to_available_exposure(self):
+        assets = AssetManager()
+        assets.update_asset(AssetSnapshot("USDT", cash=1000, available=50, equity=1000))
+        instruments = InstrumentManager()
+        instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP", "USDT"))
+        manager = PositionManager(
+            config=production_position_manager_config(
+                position_size=0.20,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+                asset_manager=assets,
+                instrument_manager=instruments,
+            )
+        )
+        orders = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
+        )
+        self.assertEqual(len(orders), 1)
+        self.assertAlmostEqual(orders[0].size_delta, 0.05)
+        self.assertAlmostEqual(orders[0].target_size, 0.05)
 
     def test_stats_by_instrument_and_currency(self):
         assets = AssetManager()

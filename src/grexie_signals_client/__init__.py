@@ -490,6 +490,16 @@ class PositionStats:
     by_currency: Dict[str, CurrencyPositionStats] = field(default_factory=dict)
 
 
+@dataclass
+class _RebalanceCandidate:
+    key: str
+    position: Position
+    delta: float
+    weight: float
+    context: Dict[str, float]
+    reason: str
+
+
 class PositionManager:
     """In-memory, fee-aware production-style position manager."""
 
@@ -613,11 +623,12 @@ class PositionManager:
         target_size = target_sign * self.config.position_size * target_confidence
         min_delta = self._effective_min_order_delta()
         position = self._positions.get(key)
-        if position is None:
+        if position is None or abs(position.size) <= 1e-9:
             if abs(target_size) < min_delta:
                 return []
-            position = Position(signal.venue, signal.instrument, entry_price=signal.price, last_price=signal.price, opened_at=now)
-            self._positions[key] = position
+            if position is None:
+                position = Position(signal.venue, signal.instrument, entry_price=signal.price, last_price=signal.price, opened_at=now)
+                self._positions[key] = position
         else:
             is_flip = _sign(position.size) != 0 and _sign(position.size) != target_sign
             if not is_flip and self.config.rebalance_interval and position.last_signal_at:
@@ -656,10 +667,14 @@ class PositionManager:
             if weight > 1e-9 and side != 0:
                 total_weight += weight
         used_budget = min(self.config.position_size, total_weight)
-        orders: List[Order] = []
-        for key, position in list(self._positions.items()):
+        reductions: List[_RebalanceCandidate] = []
+        openings: List[_RebalanceCandidate] = []
+        for key in sorted(list(self._positions)):
+            position = self._positions[key]
             target_size = sides.get(key, 0.0) * used_budget * weights.get(key, 0.0) / total_weight if total_weight > 0 else 0.0
             delta = target_size - position.size
+            if _is_flip_target(position.size, target_size):
+                delta = -position.size
             if abs(delta) <= 1e-9:
                 position.confidence = weights.get(key, 0.0)
                 continue
@@ -667,26 +682,73 @@ class PositionManager:
             is_opening = abs(position.size) <= 1e-9 and abs(target_size) > 1e-9
             is_closing = abs(target_size) <= 1e-9 and abs(position.size) > 1e-9
             if not (is_flip or is_opening or is_closing) and abs(delta) < self._effective_min_order_delta():
+                position.confidence = weights.get(key, 0.0)
                 continue
             context = contexts.get(key, {})
-            order = self._order_for_delta(
+            candidate = _RebalanceCandidate(
                 key,
-                position,
+                replace(position),
+                delta,
+                weights.get(key, 0.0),
+                context,
+                _order_reason(position, target_size),
+            )
+            if _is_exposure_reduction(position.size, position.size + delta):
+                reductions.append(candidate)
+            else:
+                openings.append(candidate)
+        if reductions:
+            return self._materialize_rebalance_orders(reductions, cap_openings=False)
+        return self._materialize_rebalance_orders(openings, cap_openings=True)
+
+    def _materialize_rebalance_orders(self, candidates: List[_RebalanceCandidate], *, cap_openings: bool) -> List[Order]:
+        orders: List[Order] = []
+        opening_exposure_by_currency: Dict[str, float] = {}
+        for candidate in candidates:
+            delta = candidate.delta
+            if cap_openings and not _is_exposure_reduction(candidate.position.size, candidate.position.size + delta):
+                metadata = self.instruments.instrument(candidate.position.venue, candidate.position.instrument)
+                available = self._available_exposure_budget(metadata.settlement_currency) - opening_exposure_by_currency.get(metadata.settlement_currency, 0.0)
+                if available <= 1e-9:
+                    if candidate.key in self._positions:
+                        self._positions[candidate.key].confidence = candidate.weight
+                    continue
+                if abs(delta) > available:
+                    delta = _sign(delta) * available
+            context = candidate.context
+            order = self._order_for_delta(
+                candidate.key,
+                candidate.position,
                 delta,
                 context.get("edge", 0.0),
                 context.get("score", 0.0),
-                _order_reason(position, target_size),
-                context.get("confidence", position.confidence),
+                candidate.reason,
+                context.get("confidence", candidate.position.confidence),
             )
             order.take_profit = context.get("take_profit", 0.0)
             order.stop_loss = context.get("stop_loss", 0.0)
             if not self._order_meets_minimum(order):
+                if candidate.key in self._positions:
+                    self._positions[candidate.key].confidence = candidate.weight
                 continue
             orders.append(order)
-            self._apply_delta(key, delta, position.last_price or position.entry_price, self._taker_fee_rate(key))
-            if key in self._positions:
-                self._positions[key].confidence = weights.get(key, 0.0)
+            if cap_openings and not _is_exposure_reduction(order.previous_size, order.target_size):
+                opening_exposure_by_currency[order.settlement_currency] = opening_exposure_by_currency.get(order.settlement_currency, 0.0) + abs(order.size_delta)
+            self._apply_delta(candidate.key, delta, candidate.position.last_price or candidate.position.entry_price, self._taker_fee_rate(candidate.key))
+            if candidate.key in self._positions:
+                self._positions[candidate.key].confidence = candidate.weight
         return orders
+
+    def _available_exposure_budget(self, currency: str) -> float:
+        asset = self.assets.asset(currency)
+        if asset is None:
+            return math.inf
+        equity = _positive_or(asset.equity, asset.cash + asset.used, asset.cash)
+        if equity <= 0:
+            return math.inf if asset.available > 0 else 0.0
+        if asset.available <= 0:
+            return 0.0
+        return max(0.0, asset.available / equity)
 
     def _order_for_delta(self, key: str, position: Position, delta: float, edge: float, score: float, reason: str, confidence: float) -> Order:
         fee_rate = self._taker_fee_rate(key)
@@ -890,6 +952,20 @@ def _order_reason(position: Position, target_size: float) -> str:
     if _sign(position.size) != _sign(target_size):
         return "flip"
     return "rebalance"
+
+
+def _is_flip_target(previous_size: float, target_size: float) -> bool:
+    return abs(previous_size) > 1e-9 and abs(target_size) > 1e-9 and _sign(previous_size) != _sign(target_size)
+
+
+def _is_exposure_reduction(previous_size: float, target_size: float) -> bool:
+    if abs(previous_size) <= 1e-9:
+        return False
+    if abs(target_size) <= 1e-9:
+        return True
+    if _sign(previous_size) != _sign(target_size):
+        return True
+    return abs(target_size) < abs(previous_size) - 1e-9
 
 
 def _blend_risk(current: float, incoming: float, gate: float) -> float:

@@ -55,7 +55,7 @@ orders = manager.handle_signal(
 )
 ```
 
-The manager mirrors the server sizing behavior: total portfolio budget is shared by confidence weight, `min_order_delta` scales by `position_size`, same-side churn can be suppressed, opposite-side flips are allowed, fees feed realized PnL, and leverage is selected from confidence, fee-adjusted edge, and score.
+The manager mirrors the server sizing behavior: total portfolio budget is shared by confidence weight, reductions/closes/first-phase flips are emitted before openings or increases, openings are capped by live asset available exposure when asset snapshots are attached, `min_order_delta` scales by `position_size`, same-side churn can be suppressed, opposite-side flips are allowed, fees feed realized PnL, and leverage is selected from confidence, fee-adjusted edge, and score.
 
 `PositionManager` ignores replay signal events and ignores live signals whose venue/instrument pair has not been configured in its `InstrumentManager`. `SignalsClient.events()` fans out events to independent consumers, so multiple position managers can share one client.
 
