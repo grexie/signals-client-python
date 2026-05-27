@@ -1080,7 +1080,8 @@ class PositionManager:
         price = _round_to_tick(position.last_price or position.entry_price, metadata.tick_size)
         requested_abs_delta = abs(delta)
         contract_notional = _instrument_contract_notional(price, metadata)
-        quantity = _round_down_to_step(requested_abs_delta, metadata.lot_size) if contract_notional > 0 else 0.0
+        closes_to_zero = abs(position.size) > 1e-9 and abs(position.size + delta) <= 1e-9
+        quantity = _round_down_to_step(requested_abs_delta, metadata.lot_size) if contract_notional > 0 and not closes_to_zero else requested_abs_delta
         notional = quantity * contract_notional
         margin = notional / leverage if leverage > 0 else 0.0
         executable_delta = _sign(delta) * quantity

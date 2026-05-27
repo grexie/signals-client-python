@@ -335,7 +335,7 @@ class ClientTests(unittest.TestCase):
         assets = AssetManager()
         assets.update_asset(AssetSnapshot("USDT", cash=1000, available=0.5, used=999.5, equity=1000))
         instruments = InstrumentManager()
-        instruments.update_instrument(InstrumentMetadata("okx", "DUST-USDT-SWAP", "USDT"))
+        instruments.update_instrument(InstrumentMetadata("okx", "DUST-USDT-SWAP", "USDT", lot_size=0.1, min_size=0.1))
         manager = PositionManager(
             config=production_position_manager_config(
                 max_margin_ratio=1.0,
@@ -358,6 +358,8 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(orders[0].side, "sell")
         self.assertEqual(orders[0].reason, "closing")
         self.assertAlmostEqual(orders[0].target_size, 0.0)
+        self.assertAlmostEqual(orders[0].size_delta, -0.005)
+        self.assertAlmostEqual(orders[0].quantity, 0.005)
 
     def test_stats_by_instrument_and_currency(self):
         assets = AssetManager()
