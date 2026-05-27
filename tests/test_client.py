@@ -330,6 +330,34 @@ class ClientTests(unittest.TestCase):
         total = sum(abs(position.size) for position in manager.positions())
         self.assertLessEqual(total, 0.01 + 1e-9)
 
+    def test_closes_position_below_minimum_position_size_ratio(self):
+        assets = AssetManager()
+        assets.update_asset(AssetSnapshot("USDT", cash=1000, available=0.5, used=999.5, equity=1000))
+        instruments = InstrumentManager()
+        instruments.update_instrument(InstrumentMetadata("okx", "DUST-USDT-SWAP", "USDT"))
+        manager = PositionManager(
+            config=production_position_manager_config(
+                max_margin_ratio=1.0,
+                min_position_size_ratio=0.01,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+                rebalance_interval=timedelta(0),
+                asset_manager=assets,
+                instrument_manager=instruments,
+            )
+        )
+        manager.add_position(
+            Position("okx", "DUST-USDT-SWAP", size=0.005, confidence=0.5, entry_price=100, last_price=100)
+        )
+
+        orders = manager.handle_signal(
+            Signal("okx", "DUST-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
+        )
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0].side, "sell")
+        self.assertEqual(orders[0].reason, "closing")
+        self.assertAlmostEqual(orders[0].target_size, 0.0)
+
     def test_stats_by_instrument_and_currency(self):
         assets = AssetManager()
         assets.update_asset(AssetSnapshot("USDT", cash=1000, available=800, used=200, equity=1000))

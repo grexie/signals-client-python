@@ -725,13 +725,17 @@ class PositionManager:
         for key in sorted(list(self._positions)):
             position = self._positions[key]
             target_size = targets.get(key, 0.0)
+            if abs(position.size) > 1e-9 and not self._meets_minimum_position_size(self._position_margin(key, position)):
+                target_size = 0.0
+            elif target_size != 0 and not self._meets_minimum_position_size(self._margin_for_quantity(key, position, target_size)):
+                if abs(position.size) <= 1e-9:
+                    position.confidence = weights.get(key, 0.0)
+                    continue
+                target_size = 0.0
             delta = target_size - position.size
             if _is_flip_target(position.size, target_size):
                 delta = -position.size
             if abs(delta) <= 1e-9:
-                position.confidence = weights.get(key, 0.0)
-                continue
-            if target_size != 0 and not self._meets_minimum_position_size(self._margin_for_quantity(key, position, target_size)) and not _is_exposure_reduction(position.size, target_size):
                 position.confidence = weights.get(key, 0.0)
                 continue
             is_flip = abs(position.size) > 1e-9 and abs(target_size) > 1e-9 and _sign(position.size) != _sign(target_size)
