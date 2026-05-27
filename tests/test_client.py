@@ -1,4 +1,5 @@
 import asyncio
+import math
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -21,7 +22,7 @@ from grexie_signals_client import (
 
 
 def order_budget_cost(order):
-    return abs(order.size_delta) + max(order.estimated_fee, 0.0)
+    return max(order.margin, 0.0) + max(order.estimated_fee, 0.0)
 
 
 class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
@@ -68,7 +69,7 @@ class ClientTests(unittest.TestCase):
     def test_position_manager_opens_and_flips(self):
         manager = PositionManager(
             config=production_position_manager_config(
-                position_size=0.10,
+                max_margin_ratio=0.10,
                 min_expected_edge=0.0,
                 min_order_delta=0.20,
                 max_leverage=5.0,
@@ -101,7 +102,7 @@ class ClientTests(unittest.TestCase):
     def test_confidence_is_allocation_weight(self):
         manager = PositionManager(
             config=production_position_manager_config(
-                position_size=0.10,
+                max_margin_ratio=0.10,
                 min_expected_edge=0.0,
                 min_order_delta=0.20,
             )
@@ -122,7 +123,7 @@ class ClientTests(unittest.TestCase):
         )
         manager = PositionManager(
             config=production_position_manager_config(
-                position_size=0.50,
+                max_margin_ratio=0.50,
                 min_expected_edge=0.0,
                 min_order_delta=0.0,
                 asset_manager=assets,
@@ -134,13 +135,13 @@ class ClientTests(unittest.TestCase):
         )
         self.assertEqual(len(orders), 1)
         self.assertEqual(orders[0].quantity, 1)
-        self.assertAlmostEqual(orders[0].size_delta, 0.333)
-        self.assertAlmostEqual(orders[0].target_size, 0.333)
+        self.assertAlmostEqual(orders[0].size_delta, 1.0)
+        self.assertAlmostEqual(orders[0].target_size, 1.0)
 
     def test_ignores_unconfigured_signals(self):
         manager = PositionManager(
             config=production_position_manager_config(
-                position_size=0.10,
+                max_margin_ratio=0.10,
                 min_expected_edge=0.0,
                 min_order_delta=0.0,
             )
@@ -155,7 +156,7 @@ class ClientTests(unittest.TestCase):
     def test_ignores_replay_signal_events(self):
         manager = PositionManager(
             config=production_position_manager_config(
-                position_size=0.10,
+                max_margin_ratio=0.10,
                 min_expected_edge=0.0,
                 min_order_delta=0.0,
             )
@@ -178,7 +179,7 @@ class ClientTests(unittest.TestCase):
         def leverage_for(instrument: str, confidence: float, take_profit: float, score: float) -> float:
             manager = PositionManager(
                 config=production_position_manager_config(
-                    position_size=1.0,
+                    max_margin_ratio=1.0,
                     min_expected_edge=0.0,
                     min_order_delta=0.0,
                     min_leverage=1.0,
@@ -208,7 +209,7 @@ class ClientTests(unittest.TestCase):
         )
         manager = PositionManager(
             config=production_position_manager_config(
-                position_size=0.10,
+                max_margin_ratio=0.10,
                 min_expected_edge=0.0,
                 min_order_delta=0.0,
                 min_leverage=1.0,
@@ -237,7 +238,7 @@ class ClientTests(unittest.TestCase):
         )
         manager = PositionManager(
             config=production_position_manager_config(
-                position_size=0.01,
+                max_margin_ratio=0.01,
                 min_expected_edge=0.0,
                 min_order_delta=0.0,
                 asset_manager=assets,
@@ -257,7 +258,7 @@ class ClientTests(unittest.TestCase):
         instruments.update_instrument(InstrumentMetadata("okx", "ETH-USDT-SWAP", "USDT"))
         manager = PositionManager(
             config=production_position_manager_config(
-                position_size=0.20,
+                max_margin_ratio=0.20,
                 min_expected_edge=0.0,
                 min_order_delta=0.0,
                 asset_manager=assets,
@@ -265,7 +266,7 @@ class ClientTests(unittest.TestCase):
             )
         )
         manager.add_position(
-            Position("okx", "BTC-USDT-SWAP", size=0.15, confidence=1.0, entry_price=100, last_price=100)
+            Position("okx", "BTC-USDT-SWAP", size=2.0, confidence=1.0, entry_price=100, last_price=100)
         )
         reductions = manager.handle_signal(
             Signal("okx", "ETH-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
@@ -273,7 +274,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(reductions), 1)
         self.assertEqual(reductions[0].instrument, "BTC-USDT-SWAP")
         self.assertEqual(reductions[0].side, "sell")
-        expected_btc_target = 0.10 / (1 + reductions[0].leverage * reductions[0].fee_rate)
+        expected_btc_target = (100.0 / (1 + reductions[0].leverage * reductions[0].fee_rate)) / reductions[0].price
         self.assertAlmostEqual(reductions[0].target_size, expected_btc_target)
 
         openings = manager.handle_signal(
@@ -290,7 +291,7 @@ class ClientTests(unittest.TestCase):
         instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP", "USDT"))
         manager = PositionManager(
             config=production_position_manager_config(
-                position_size=0.20,
+                max_margin_ratio=0.20,
                 min_expected_edge=0.0,
                 min_order_delta=0.0,
                 asset_manager=assets,
@@ -301,8 +302,8 @@ class ClientTests(unittest.TestCase):
             Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
         )
         self.assertEqual(len(orders), 1)
-        self.assertLessEqual(order_budget_cost(orders[0]), 0.05 + 1e-9)
-        self.assertLess(orders[0].size_delta, 0.05)
+        self.assertLessEqual(order_budget_cost(orders[0]), 50 + 1e-9)
+        self.assertLess(orders[0].margin, 50)
 
     def test_caps_openings_to_remaining_portfolio_budget_without_asset_snapshots(self):
         instruments = InstrumentManager()
@@ -310,7 +311,7 @@ class ClientTests(unittest.TestCase):
         instruments.update_instrument(InstrumentMetadata("okx", "ETH-USDT-SWAP", "USDT"))
         manager = PositionManager(
             config=production_position_manager_config(
-                position_size=1.0,
+                max_margin_ratio=1.0,
                 min_expected_edge=0.0,
                 min_order_delta=0.0,
                 rebalance_interval=timedelta(hours=6),
@@ -327,7 +328,7 @@ class ClientTests(unittest.TestCase):
             Signal("okx", "ETH-USDT-SWAP", 0.51, "buy", 0.02, 0.004, price=100, timestamp=datetime(2026, 5, 27, 0, 1, tzinfo=timezone.utc))
         )
         total = sum(abs(position.size) for position in manager.positions())
-        self.assertLessEqual(total, 1.0 + 1e-9)
+        self.assertLessEqual(total, 0.01 + 1e-9)
 
     def test_stats_by_instrument_and_currency(self):
         assets = AssetManager()

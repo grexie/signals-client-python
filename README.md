@@ -38,7 +38,8 @@ from grexie_signals_client import (
 
 manager = PositionManager(
     config=production_position_manager_config(
-        position_size=0.10,
+        max_margin_ratio=0.10,
+        min_position_size_ratio=0.01,
         min_expected_edge=0.0045,
         min_order_delta=0.20,
         maker_fee_rate=0.0002,
@@ -55,11 +56,11 @@ orders = manager.handle_signal(
 )
 ```
 
-The manager mirrors the server sizing behavior: total portfolio budget is shared by confidence weight, reductions/closes/first-phase flips are emitted before openings or increases, openings are capped by live asset available exposure when asset snapshots are attached, `min_order_delta` scales by `position_size`, same-side churn can be suppressed, opposite-side flips are allowed, fees feed realized PnL, and leverage is selected from confidence, fee-adjusted edge, and score.
+The manager mirrors the server sizing behavior: `max_margin_ratio` is the fraction of `AssetManager` capital that can be allocated as portfolio margin, `min_position_size_ratio` defaults to 1% of capital, positions are signed executable quantities/lots, and emitted orders include quantity, margin, notional, and fee estimates. Portfolio budget is shared by confidence weight, reductions/closes/first-phase flips are emitted before openings or increases, openings are capped by live asset available exposure when asset snapshots are attached, `min_order_delta` scales by the max margin budget, same-side churn can be suppressed, opposite-side flips are allowed, fees feed realized PnL, and leverage is selected from confidence, fee-adjusted edge, and score.
 
 `PositionManager` ignores replay signal events and ignores live signals whose venue/instrument pair has not been configured in its `InstrumentManager`. `SignalsClient.events()` fans out events to independent consumers, so multiple position managers can share one client.
 
-Use `add_position`, `update_position`, and `close_position` to hydrate or mutate the runtime from an exchange account.
+Use `add_position`, `update_position`, `replace_positions`, and `close_position` to hydrate or reconcile the runtime from an exchange account.
 
 ## Assets, Instruments, And Stats
 

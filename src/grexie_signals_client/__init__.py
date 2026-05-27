@@ -352,6 +352,8 @@ class InstrumentMetadata:
     lot_size: float = 0.0
     min_size: float = 0.0
     tick_size: float = 0.0
+    contract_value: float = 0.0
+    contract_multiplier: float = 0.0
     max_leverage: float = 0.0
 
 
@@ -377,14 +379,18 @@ class InstrumentManager:
 
 @dataclass
 class PositionManagerConfig:
-    position_size: float = 1.0
+    max_margin_ratio: float = 1.0
+    position_size: float = 0.0
     min_expected_edge: float = 0.0045
     min_order_delta: float = 0.20
+    min_position_size_ratio: float = 0.01
     rebalance_interval: timedelta = timedelta(hours=6)
     maker_fee_rate: float = 0.0002
     taker_fee_rate: float = 0.0005
     min_leverage: float = 1.0
     max_leverage: float = 1.0
+    available_margin_buffer: float = 0.10
+    executable_margin_buffer: float = 0.001
     instruments: Dict[str, InstrumentConfig] = field(default_factory=dict)
     asset_manager: Optional[AssetManager] = None
     instrument_manager: Optional[InstrumentManager] = None
@@ -392,8 +398,10 @@ class PositionManagerConfig:
 
 def production_position_manager_config(**overrides: Any) -> PositionManagerConfig:
     """Return server-compatible execution-policy defaults."""
-
-    return replace(PositionManagerConfig(), **overrides)
+    config = replace(PositionManagerConfig(), **overrides)
+    if "max_margin_ratio" not in overrides and "position_size" in overrides and 0 < config.position_size <= 1:
+        config.max_margin_ratio = config.position_size
+    return config
 
 
 @dataclass
@@ -423,7 +431,7 @@ class Position:
 
     @property
     def unrealized_pnl(self) -> float:
-        return _move(self) * abs(self.size)
+        return _move(self) * abs(self.size) * _positive_or(self.entry_price, 1.0)
 
 
 @dataclass
@@ -442,6 +450,7 @@ class Order:
     estimated_fee: float
     leverage: float
     estimated_fee_value: float = 0.0
+    margin: float = 0.0
     quantity: float = 0.0
     notional: float = 0.0
     settlement_currency: str = "USDT"
@@ -530,6 +539,7 @@ class _RebalanceCandidate:
 
 @dataclass
 class _ExecutableAllocation:
+    quantity: float = 0.0
     margin: float = 0.0
     fee: float = 0.0
 
@@ -555,10 +565,19 @@ class PositionManager:
                 yield order
 
     def add_position(self, position: Position) -> None:
+        if position.leverage <= 0:
+            position.leverage = self._min_leverage(_position_key(position.venue, position.instrument))
         self._positions[_position_key(position.venue, position.instrument)] = position
 
     def update_position(self, position: Position) -> None:
         self.add_position(position)
+
+    def replace_positions(self, positions: Iterable[Position]) -> None:
+        self._positions = {}
+        for position in positions:
+            if not position.venue or not position.instrument or abs(position.size) <= 1e-9:
+                continue
+            self.add_position(replace(position))
 
     def close_position(self, venue: str, instrument: str) -> List[Order]:
         key = _position_key(venue, instrument)
@@ -587,14 +606,14 @@ class PositionManager:
         for key, position in self._positions.items():
             metadata = self.instruments.instrument(position.venue, position.instrument)
             asset = self.assets.asset(metadata.settlement_currency)
-            equity = _positive_or(asset.equity if asset else 0.0, (asset.cash + asset.used) if asset else 0.0, 1.0)
+            equity = _positive_or(asset.equity if asset else 0.0, (asset.cash + asset.used) if asset else 0.0, asset.cash if asset else 0.0, 1.0)
             price = _round_to_tick(position.last_price or position.entry_price, metadata.tick_size)
-            notional_raw = abs(position.size) * equity * _positive_or(position.leverage, self._min_leverage(key), 1.0)
-            quantity = _round_down_to_step(notional_raw / price, metadata.lot_size) if price > 0 else 0.0
-            notional = quantity * price
-            realized = position.realized_pnl * equity
-            unrealized = position.unrealized_pnl * equity
-            fees = position.fees * equity
+            contract_notional = _instrument_contract_notional(price, metadata)
+            quantity = _round_down_to_step(abs(position.size), metadata.lot_size) if contract_notional > 0 else abs(position.size)
+            notional = quantity * contract_notional
+            realized = position.realized_pnl
+            unrealized = self._position_unrealized_pnl(key, position)
+            fees = position.fees
             stats.by_instrument[key] = InstrumentPositionStats(
                 position.venue,
                 position.instrument,
@@ -606,9 +625,9 @@ class PositionManager:
                 realized,
                 unrealized,
                 fees,
-                position.realized_pnl,
-                position.unrealized_pnl,
-                position.realized_pnl + position.unrealized_pnl,
+                _ratio_or_zero(position.realized_pnl, equity),
+                _ratio_or_zero(unrealized, equity),
+                _ratio_or_zero(position.realized_pnl + unrealized, equity),
                 position.leverage,
             )
             stats.realized_pnl += realized
@@ -654,11 +673,11 @@ class PositionManager:
         if self.config.min_expected_edge > 0 and edge < self.config.min_expected_edge:
             return []
         now = signal.timestamp or datetime.now(timezone.utc)
-        target_size = target_sign * self.config.position_size
+        portfolio_budget = self._max_portfolio_margin_budget()
         min_delta = self._effective_min_order_delta()
         position = self._positions.get(key)
         if position is None or abs(position.size) <= 1e-9:
-            if abs(target_size) < min_delta:
+            if portfolio_budget < min_delta or not self._meets_minimum_position_size(portfolio_budget):
                 return []
             if position is None:
                 position = Position(signal.venue, signal.instrument, entry_price=signal.price, last_price=signal.price, opened_at=now)
@@ -668,8 +687,6 @@ class PositionManager:
             if not is_flip and self.config.rebalance_interval and position.last_signal_at:
                 if now < position.last_signal_at + self.config.rebalance_interval:
                     return []
-            if not is_flip and min_delta > 0 and abs(target_size - position.size) < min_delta:
-                return []
         position.confidence = target_confidence
         position.last_signal_at = now
         if signal.price > 0:
@@ -689,11 +706,16 @@ class PositionManager:
         )
 
     def _rebalance(self, side_overrides: Dict[str, float], contexts: Dict[str, Dict[str, float]]) -> List[Order]:
+        portfolio_budget = self._max_portfolio_margin_budget()
+        if portfolio_budget <= 0 or not self._positions:
+            return []
         weights: Dict[str, float] = {}
         sides: Dict[str, float] = {}
         for key, position in self._positions.items():
             has_override = key in side_overrides
-            weight = _clamp01(position.confidence) or (0.0 if has_override else _confidence_from_size(position, self.config.position_size))
+            weight = _clamp01(position.confidence)
+            if not has_override and weight <= 0:
+                weight = _clamp01(self._position_margin(key, position) / portfolio_budget)
             side = side_overrides.get(key, _sign(position.size))
             weights[key] = weight
             sides[key] = side
@@ -709,10 +731,13 @@ class PositionManager:
             if abs(delta) <= 1e-9:
                 position.confidence = weights.get(key, 0.0)
                 continue
+            if target_size != 0 and not self._meets_minimum_position_size(self._margin_for_quantity(key, position, target_size)) and not _is_exposure_reduction(position.size, target_size):
+                position.confidence = weights.get(key, 0.0)
+                continue
             is_flip = abs(position.size) > 1e-9 and abs(target_size) > 1e-9 and _sign(position.size) != _sign(target_size)
             is_opening = abs(position.size) <= 1e-9 and abs(target_size) > 1e-9
             is_closing = abs(target_size) <= 1e-9 and abs(position.size) > 1e-9
-            if not (is_flip or is_opening or is_closing) and abs(delta) < self._effective_min_order_delta():
+            if not (is_flip or is_opening or is_closing) and self._margin_for_quantity(key, position, delta) < self._effective_min_order_delta():
                 position.confidence = weights.get(key, 0.0)
                 continue
             context = contexts.get(key, {})
@@ -740,7 +765,8 @@ class PositionManager:
         contexts: Dict[str, Dict[str, float]],
     ) -> Dict[str, float]:
         targets: Dict[str, float] = {}
-        if self.config.position_size <= 0:
+        portfolio_budget = self._max_portfolio_margin_budget()
+        if portfolio_budget <= 0:
             return targets
         active = {key for key in keys if weights.get(key, 0.0) > 1e-9 and sides.get(key, 0.0) != 0}
         while active:
@@ -755,7 +781,7 @@ class PositionManager:
                 position = self._positions.get(key)
                 if position is None:
                     continue
-                desired_budget = self.config.position_size * weights.get(key, 0.0) / total_weight
+                desired_budget = portfolio_budget * weights.get(key, 0.0) / total_weight
                 executable = self._executable_allocation_for_budget(key, position, desired_budget, contexts.get(key, {}))
                 if executable.margin > 1e-9:
                     continue
@@ -778,13 +804,15 @@ class PositionManager:
             position = self._positions.get(key)
             if position is None:
                 continue
-            desired_budget = self.config.position_size * weights.get(key, 0.0) / total_weight
+            desired_budget = portfolio_budget * weights.get(key, 0.0) / total_weight
             executable = self._executable_allocation_for_budget(key, position, desired_budget, contexts.get(key, {}))
             if executable.margin <= 1e-9:
                 continue
-            targets[key] = sides.get(key, 0.0) * executable.margin
+            if not self._meets_minimum_position_size(executable.margin):
+                continue
+            targets[key] = sides.get(key, 0.0) * executable.quantity
             allocated += executable.margin + executable.fee
-        free = self.config.position_size - allocated
+        free = portfolio_budget - allocated
         if free <= 1e-9:
             return targets
         priority = sorted(keys, key=lambda key: (-weights.get(key, 0.0), key))
@@ -797,12 +825,18 @@ class PositionManager:
             step = self._executable_lot_step_cost(key, position, contexts.get(key, {}))
             step_cost = step.margin + step.fee
             if step_cost <= 1e-9:
-                targets[key] = targets.get(key, 0.0) + sides.get(key, 0.0) * free
+                executable = self._executable_allocation_for_budget(key, position, free, contexts.get(key, {}))
+                if executable.quantity > 1e-9 and self._meets_minimum_position_size(executable.margin):
+                    targets[key] = targets.get(key, 0.0) + sides.get(key, 0.0) * executable.quantity
                 break
             steps = math.floor((free + 1e-9) / step_cost)
             if steps <= 0:
                 continue
-            targets[key] = targets.get(key, 0.0) + sides.get(key, 0.0) * steps * step.margin
+            next_size = targets.get(key, 0.0) + sides.get(key, 0.0) * steps * step.quantity
+            next_margin = abs(next_size) * step.margin / step.quantity if step.quantity > 0 else 0.0
+            if not self._meets_minimum_position_size(next_margin):
+                continue
+            targets[key] = next_size
             free -= steps * step_cost
         return targets
 
@@ -852,18 +886,63 @@ class PositionManager:
         asset = self.assets.asset(currency)
         if asset is None:
             return portfolio_budget
-        equity = _positive_or(asset.equity, asset.cash + asset.used, asset.cash)
-        if equity <= 0:
-            return portfolio_budget if asset.available > 0 else 0.0
         if asset.available <= 0:
             return 0.0
-        return min(max(0.0, asset.available / equity), portfolio_budget)
+        budget = max(0.0, asset.available)
+        if self.config.available_margin_buffer > 0:
+            budget *= 1 - self.config.available_margin_buffer
+        return min(budget, portfolio_budget)
 
     def _available_portfolio_budget(self) -> float:
-        if self.config.position_size <= 0:
+        max_budget = self._max_portfolio_margin_budget()
+        used = sum(self._position_margin(key, position) for key, position in self._positions.items())
+        return max(0.0, max_budget - used)
+
+    def _max_portfolio_margin_budget(self) -> float:
+        capital = self._portfolio_capital()
+        if capital <= 0 or self.config.max_margin_ratio <= 0:
             return 0.0
-        used = sum(abs(position.size) for position in self._positions.values())
-        return max(0.0, self.config.position_size - used)
+        return capital * self.config.max_margin_ratio
+
+    def _portfolio_capital(self) -> float:
+        capital = sum(_positive_or(asset.equity, asset.cash + asset.used, asset.cash) for asset in self.assets.assets())
+        return capital if capital > 0 else 1.0
+
+    def _position_margin(self, key: str, position: Position) -> float:
+        if abs(position.size) <= 1e-9:
+            return 0.0
+        return self._margin_for_quantity(key, position, position.size)
+
+    def _margin_for_quantity(self, key: str, position: Position, quantity: float) -> float:
+        if abs(quantity) <= 1e-9:
+            return 0.0
+        metadata = self.instruments.instrument(position.venue, position.instrument)
+        price = _round_to_tick(position.last_price or position.entry_price, metadata.tick_size)
+        contract_notional = _instrument_contract_notional(price, metadata)
+        leverage = _positive_or(position.leverage, self._min_leverage(key), 1.0)
+        if contract_notional <= 0 or leverage <= 0:
+            return 0.0
+        return abs(quantity) * contract_notional / leverage
+
+    def _position_unrealized_pnl(self, key: str, position: Position) -> float:
+        if abs(position.size) <= 1e-9 or position.entry_price <= 0 or position.last_price <= 0:
+            return 0.0
+        return self._realized_gross_for_quantity(key, position, abs(position.size), position.last_price)
+
+    def _realized_gross_for_quantity(self, key: str, position: Position, quantity: float, exit_price: float) -> float:
+        if quantity <= 1e-9 or position.entry_price <= 0 or exit_price <= 0:
+            return 0.0
+        metadata = self.instruments.instrument(position.venue, position.instrument)
+        contract_value = _positive_or(metadata.contract_value, 1.0)
+        contract_multiplier = _positive_or(metadata.contract_multiplier, 1.0)
+        move = position.entry_price - exit_price if position.size < 0 else exit_price - position.entry_price
+        return move * quantity * contract_value * contract_multiplier
+
+    def _fee_for_quantity(self, key: str, position: Position, quantity: float, price: float, fee_rate: float) -> float:
+        if quantity <= 1e-9 or price <= 0 or fee_rate <= 0:
+            return 0.0
+        metadata = self.instruments.instrument(position.venue, position.instrument)
+        return quantity * _instrument_contract_notional(price, metadata) * fee_rate
 
     def _executable_allocation_for_budget(
         self,
@@ -875,39 +954,43 @@ class PositionManager:
         if budget <= 1e-9:
             return _ExecutableAllocation()
         metadata = self.instruments.instrument(position.venue, position.instrument)
-        asset = self.assets.asset(metadata.settlement_currency)
-        equity = _positive_or(asset.equity if asset else 0.0, (asset.cash + asset.used) if asset else 0.0, 1.0)
         price = _round_to_tick(position.last_price or position.entry_price, metadata.tick_size)
         leverage = self._select_leverage(key, context.get("confidence", position.confidence), context.get("edge", 0.0), context.get("score", 0.0))
-        if price <= 0 or equity <= 0 or leverage <= 0:
+        contract_notional = _instrument_contract_notional(price, metadata)
+        if contract_notional <= 0 or leverage <= 0:
             return _ExecutableAllocation()
         fee_rate = self._taker_fee_rate(key)
-        fee_multiplier = max(1.0 + leverage * fee_rate, 1.0)
-        max_margin = budget / fee_multiplier
-        quantity = _round_down_to_step(max_margin * equity * leverage / price, metadata.lot_size)
-        if quantity <= 1e-9:
-            return _ExecutableAllocation()
-        if metadata.min_size > 0 and quantity < metadata.min_size:
-            return _ExecutableAllocation()
-        margin = quantity * price / (equity * leverage)
-        fee = quantity * price * fee_rate / equity
-        if margin + fee > budget + 1e-9:
-            return _ExecutableAllocation()
-        return _ExecutableAllocation(margin, fee)
+        max_margin = budget
+        if metadata.lot_size <= 0:
+            fee_multiplier = 1 + leverage * fee_rate
+            if fee_multiplier > 0:
+                max_margin = budget / fee_multiplier
+        quantity = _round_down_to_step(max_margin * leverage / contract_notional, metadata.lot_size)
+        while quantity > 1e-9:
+            if metadata.min_size > 0 and quantity < metadata.min_size:
+                return _ExecutableAllocation()
+            margin = quantity * contract_notional / leverage
+            fee = quantity * contract_notional * fee_rate
+            if margin + fee <= budget + 1e-9:
+                return _ExecutableAllocation(quantity, margin, fee)
+            if metadata.lot_size <= 0:
+                return _ExecutableAllocation()
+            quantity = _round_down_to_step(quantity - metadata.lot_size, metadata.lot_size)
+        return _ExecutableAllocation()
 
     def _executable_lot_step_cost(self, key: str, position: Position, context: Dict[str, float]) -> _ExecutableAllocation:
         metadata = self.instruments.instrument(position.venue, position.instrument)
         if metadata.lot_size <= 0:
             return _ExecutableAllocation()
-        asset = self.assets.asset(metadata.settlement_currency)
-        equity = _positive_or(asset.equity if asset else 0.0, (asset.cash + asset.used) if asset else 0.0, 1.0)
         price = _round_to_tick(position.last_price or position.entry_price, metadata.tick_size)
         leverage = self._select_leverage(key, context.get("confidence", position.confidence), context.get("edge", 0.0), context.get("score", 0.0))
-        if price <= 0 or equity <= 0 or leverage <= 0:
+        contract_notional = _instrument_contract_notional(price, metadata)
+        if contract_notional <= 0 or leverage <= 0:
             return _ExecutableAllocation()
         return _ExecutableAllocation(
-            metadata.lot_size * price / (equity * leverage),
-            metadata.lot_size * price * self._taker_fee_rate(key) / equity,
+            metadata.lot_size,
+            metadata.lot_size * contract_notional / leverage,
+            metadata.lot_size * contract_notional * self._taker_fee_rate(key),
         )
 
     def _cap_opening_delta_to_budget(
@@ -923,8 +1006,10 @@ class PositionManager:
         executable = self._executable_allocation_for_budget(key, position, budget, context)
         if executable.margin <= 1e-9:
             return 0.0
-        if executable.margin < abs(delta):
-            return _sign(delta) * executable.margin
+        if not self._meets_minimum_position_size(executable.margin):
+            return 0.0
+        if executable.quantity < abs(delta):
+            return self._cap_executable_delta_with_buffered_cost(key, position, _sign(delta) * executable.quantity, context, budget)
         order = self._order_for_delta(
             key,
             position,
@@ -935,26 +1020,65 @@ class PositionManager:
             context.get("confidence", position.confidence),
         )
         if _order_budget_cost(order) > budget + 1e-9:
-            return _sign(delta) * executable.margin
+            return self._cap_executable_delta_with_buffered_cost(key, position, _sign(delta) * executable.quantity, context, budget)
         return delta
+
+    def _cap_executable_delta_with_buffered_cost(
+        self,
+        key: str,
+        position: Position,
+        delta: float,
+        context: Dict[str, float],
+        budget: float,
+    ) -> float:
+        if abs(delta) <= 1e-9 or budget <= 1e-9:
+            return 0.0
+        metadata = self.instruments.instrument(position.venue, position.instrument)
+        quantity_step = metadata.lot_size if metadata.lot_size > 0 else 0.0
+        candidate = abs(delta)
+        while candidate > 1e-9:
+            order = self._order_for_delta(key, position, _sign(delta) * candidate, context.get("edge", 0.0), context.get("score", 0.0), "budget-check", context.get("confidence", position.confidence))
+            if _order_budget_cost(order) <= budget + 1e-9:
+                return _sign(delta) * candidate
+            if quantity_step <= 1e-9:
+                return self._cap_continuous_opening_delta_to_budget(key, position, delta, context, budget)
+            candidate -= quantity_step
+        return 0.0
+
+    def _cap_continuous_opening_delta_to_budget(
+        self,
+        key: str,
+        position: Position,
+        delta: float,
+        context: Dict[str, float],
+        budget: float,
+    ) -> float:
+        if abs(delta) <= 1e-9 or budget <= 1e-9:
+            return 0.0
+        low = 0.0
+        high = abs(delta)
+        for _ in range(64):
+            mid = (low + high) / 2
+            if mid <= 1e-9:
+                break
+            order = self._order_for_delta(key, position, _sign(delta) * mid, context.get("edge", 0.0), context.get("score", 0.0), "budget-check", context.get("confidence", position.confidence))
+            if _order_budget_cost(order) <= budget + 1e-9:
+                low = mid
+            else:
+                high = mid
+        return 0.0 if low <= 1e-9 else _sign(delta) * low
 
     def _order_for_delta(self, key: str, position: Position, delta: float, edge: float, score: float, reason: str, confidence: float) -> Order:
         fee_rate = self._taker_fee_rate(key)
         leverage = self._select_leverage(key, confidence, edge, score)
         metadata = self.instruments.instrument(position.venue, position.instrument)
-        asset = self.assets.asset(metadata.settlement_currency)
-        equity = _positive_or(asset.equity if asset else 0.0, (asset.cash + asset.used) if asset else 0.0, 1.0)
         price = _round_to_tick(position.last_price or position.entry_price, metadata.tick_size)
         requested_abs_delta = abs(delta)
-        notional = requested_abs_delta * equity * leverage
-        quantity = _round_down_to_step(notional / price, metadata.lot_size) if price > 0 else 0.0
-        notional = quantity * price
-        executable_abs_delta = requested_abs_delta
-        if equity > 0 and leverage > 0 and price > 0:
-            executable_abs_delta = notional / (equity * leverage)
-        if executable_abs_delta > requested_abs_delta:
-            executable_abs_delta = requested_abs_delta
-        executable_delta = _sign(delta) * executable_abs_delta
+        contract_notional = _instrument_contract_notional(price, metadata)
+        quantity = _round_down_to_step(requested_abs_delta, metadata.lot_size) if contract_notional > 0 else 0.0
+        notional = quantity * contract_notional
+        margin = notional / leverage if leverage > 0 else 0.0
+        executable_delta = _sign(delta) * quantity
         return Order(
             venue=position.venue,
             instrument=position.instrument,
@@ -968,9 +1092,10 @@ class PositionManager:
             score=score,
             expected_edge=edge,
             fee_rate=fee_rate,
-            estimated_fee=_fee_exposure_for_notional(notional, fee_rate, equity),
+            estimated_fee=_fee_value_for_notional(notional, fee_rate),
             leverage=leverage,
             estimated_fee_value=notional * fee_rate,
+            margin=margin,
             quantity=quantity,
             notional=notional,
             settlement_currency=metadata.settlement_currency,
@@ -989,7 +1114,7 @@ class PositionManager:
             if price > 0:
                 position.entry_price = (position.entry_price * abs(position.size) + price * abs(delta)) / next_abs if next_abs > 0 and abs(position.size) > 1e-9 and position.entry_price > 0 else price
                 position.last_price = price
-            fee = _fee_exposure_for_margin(abs(delta), _positive_or(position.leverage, self._min_leverage(key), 1.0), fee_rate)
+            fee = self._fee_for_quantity(key, position, abs(delta), price, fee_rate)
             position.fees += fee
             position.realized_pnl -= fee
             position.size += delta
@@ -997,8 +1122,8 @@ class PositionManager:
         if price > 0:
             position.last_price = price
         closing = min(abs(position.size), abs(delta))
-        gross = _move(position) * closing
-        fee = _fee_exposure_for_margin(closing, _positive_or(position.leverage, self._min_leverage(key), 1.0), fee_rate)
+        gross = self._realized_gross_for_quantity(key, position, closing, price)
+        fee = self._fee_for_quantity(key, position, closing, price, fee_rate)
         position.realized_gross += gross
         position.fees += fee
         position.realized_pnl += gross - fee
@@ -1016,11 +1141,20 @@ class PositionManager:
         position.last_price = price
         position.confidence = 0.0
         position.realized_gross = 0.0
-        position.fees = _fee_exposure_for_margin(remaining, _positive_or(position.leverage, self._min_leverage(key), 1.0), fee_rate)
+        position.fees = self._fee_for_quantity(key, position, remaining, price, fee_rate)
         position.realized_pnl = -position.fees
 
     def _effective_min_order_delta(self) -> float:
-        return max(self.config.min_order_delta, 0.0) * max(self.config.position_size, 0.0)
+        return max(self.config.min_order_delta, 0.0) * self._max_portfolio_margin_budget()
+
+    def _minimum_position_size(self) -> float:
+        if self.config.min_position_size_ratio <= 0:
+            return 0.0
+        return self.config.min_position_size_ratio * self._portfolio_capital()
+
+    def _meets_minimum_position_size(self, size: float) -> bool:
+        minimum = self._minimum_position_size()
+        return minimum <= 0 or abs(size) + 1e-9 >= minimum
 
     def _select_leverage(self, key: str, confidence: float, edge: float, score: float = 0.0) -> float:
         min_leverage = self._min_leverage(key)
@@ -1097,13 +1231,22 @@ def _signal_from_payload(payload: Dict[str, Any]) -> Signal:
 
 
 def _normalize_config(config: PositionManagerConfig) -> PositionManagerConfig:
-    config.position_size = min(max(config.position_size, 0.0), 1.0)
+    if config.max_margin_ratio <= 0:
+        if 0 < config.position_size <= 1:
+            config.max_margin_ratio = config.position_size
+        else:
+            config.max_margin_ratio = 1.0
+    config.max_margin_ratio = min(max(config.max_margin_ratio, 0.0), 1.0)
+    config.position_size = max(config.position_size, 0.0)
     config.min_expected_edge = max(config.min_expected_edge, 0.0)
     config.min_order_delta = min(max(config.min_order_delta, 0.0), 1.0)
+    config.min_position_size_ratio = min(max(config.min_position_size_ratio, 0.0), 1.0)
     config.maker_fee_rate = max(config.maker_fee_rate, 0.0)
     config.taker_fee_rate = max(config.taker_fee_rate, 0.0)
     config.min_leverage = max(config.min_leverage, 0.0)
     config.max_leverage = max(config.max_leverage, 0.0)
+    config.available_margin_buffer = min(max(config.available_margin_buffer, 0.0), 0.95)
+    config.executable_margin_buffer = min(max(config.executable_margin_buffer, 0.0), 0.05)
     return config
 
 
@@ -1155,13 +1298,23 @@ def _fee_adjusted_expected_edge(signal: Signal, taker_fee_rate: float) -> float:
 
 
 def _order_budget_cost(order: Order) -> float:
-    return abs(order.size_delta) + max(order.estimated_fee, 0.0)
+    return max(order.margin, 0.0) + max(order.estimated_fee, 0.0)
 
 
-def _fee_exposure_for_notional(notional: float, fee_rate: float, equity: float) -> float:
-    if notional <= 0 or fee_rate <= 0 or equity <= 0:
+def _fee_value_for_notional(notional: float, fee_rate: float) -> float:
+    if notional <= 0 or fee_rate <= 0:
         return 0.0
-    return notional * fee_rate / equity
+    return notional * fee_rate
+
+
+def _instrument_contract_notional(price: float, metadata: InstrumentMetadata) -> float:
+    if price <= 0:
+        return 0.0
+    return price * _positive_or(metadata.contract_value, 1.0) * _positive_or(metadata.contract_multiplier, 1.0)
+
+
+def _ratio_or_zero(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator > 0 else 0.0
 
 
 def _fee_exposure_for_margin(margin: float, leverage: float, fee_rate: float) -> float:
