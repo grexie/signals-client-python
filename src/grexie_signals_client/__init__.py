@@ -848,15 +848,22 @@ class PositionManager:
         return orders
 
     def _available_exposure_budget(self, currency: str) -> float:
+        portfolio_budget = self._available_portfolio_budget()
         asset = self.assets.asset(currency)
         if asset is None:
-            return math.inf
+            return portfolio_budget
         equity = _positive_or(asset.equity, asset.cash + asset.used, asset.cash)
         if equity <= 0:
-            return math.inf if asset.available > 0 else 0.0
+            return portfolio_budget if asset.available > 0 else 0.0
         if asset.available <= 0:
             return 0.0
-        return max(0.0, asset.available / equity)
+        return min(max(0.0, asset.available / equity), portfolio_budget)
+
+    def _available_portfolio_budget(self) -> float:
+        if self.config.position_size <= 0:
+            return 0.0
+        used = sum(abs(position.size) for position in self._positions.values())
+        return max(0.0, self.config.position_size - used)
 
     def _executable_allocation_for_budget(
         self,

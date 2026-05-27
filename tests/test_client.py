@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from grexie_signals_client import (
     AssetManager,
@@ -302,6 +303,31 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(orders), 1)
         self.assertLessEqual(order_budget_cost(orders[0]), 0.05 + 1e-9)
         self.assertLess(orders[0].size_delta, 0.05)
+
+    def test_caps_openings_to_remaining_portfolio_budget_without_asset_snapshots(self):
+        instruments = InstrumentManager()
+        instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP", "USDT"))
+        instruments.update_instrument(InstrumentMetadata("okx", "ETH-USDT-SWAP", "USDT"))
+        manager = PositionManager(
+            config=production_position_manager_config(
+                position_size=1.0,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+                rebalance_interval=timedelta(hours=6),
+                min_leverage=1.0,
+                max_leverage=1.0,
+                instrument_manager=instruments,
+            )
+        )
+        orders = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.51, "buy", 0.02, 0.004, price=100, timestamp=datetime(2026, 5, 27, tzinfo=timezone.utc))
+        )
+        self.assertEqual(len(orders), 1)
+        manager.handle_signal(
+            Signal("okx", "ETH-USDT-SWAP", 0.51, "buy", 0.02, 0.004, price=100, timestamp=datetime(2026, 5, 27, 0, 1, tzinfo=timezone.utc))
+        )
+        total = sum(abs(position.size) for position in manager.positions())
+        self.assertLessEqual(total, 1.0 + 1e-9)
 
     def test_stats_by_instrument_and_currency(self):
         assets = AssetManager()
