@@ -331,6 +331,7 @@ class ClientTests(unittest.TestCase):
         self.assertLessEqual(total, 0.01 + 1e-9)
 
     def test_closes_position_below_minimum_position_size_ratio(self):
+        last_signal_at = datetime.now(timezone.utc) - timedelta(minutes=1)
         assets = AssetManager()
         assets.update_asset(AssetSnapshot("USDT", cash=1000, available=0.5, used=999.5, equity=1000))
         instruments = InstrumentManager()
@@ -341,17 +342,17 @@ class ClientTests(unittest.TestCase):
                 min_position_size_ratio=0.01,
                 min_expected_edge=0.0,
                 min_order_delta=0.0,
-                rebalance_interval=timedelta(0),
+                rebalance_interval=timedelta(hours=6),
                 asset_manager=assets,
                 instrument_manager=instruments,
             )
         )
         manager.add_position(
-            Position("okx", "DUST-USDT-SWAP", size=0.005, confidence=0.5, entry_price=100, last_price=100)
+            Position("okx", "DUST-USDT-SWAP", size=0.005, confidence=0.5, entry_price=100, last_price=100, last_signal_at=last_signal_at)
         )
 
         orders = manager.handle_signal(
-            Signal("okx", "DUST-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
+            Signal("okx", "DUST-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100, timestamp=last_signal_at + timedelta(minutes=1))
         )
         self.assertEqual(len(orders), 1)
         self.assertEqual(orders[0].side, "sell")

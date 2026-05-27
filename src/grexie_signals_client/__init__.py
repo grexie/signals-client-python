@@ -684,7 +684,8 @@ class PositionManager:
                 self._positions[key] = position
         else:
             is_flip = _sign(position.size) != 0 and _sign(position.size) != target_sign
-            if not is_flip and self.config.rebalance_interval and position.last_signal_at:
+            below_minimum = not self._meets_minimum_position_size(self._position_margin(key, position))
+            if not is_flip and not below_minimum and self.config.rebalance_interval and position.last_signal_at:
                 if now < position.last_signal_at + self.config.rebalance_interval:
                     return []
         position.confidence = target_confidence
