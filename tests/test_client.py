@@ -346,6 +346,41 @@ class ClientTests(unittest.TestCase):
         self.assertGreaterEqual(closed[0].mfe, 0.03 - 1e-9)
         self.assertGreater(closed[0].realized_pnl, 0)
 
+    def test_persists_and_hydrates_trailing_stop_state(self):
+        snapshots = []
+        manager = PositionManager(
+            config=production_position_manager_config(
+                max_margin_ratio=1.0,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+                persist=snapshots.append,
+            )
+        )
+        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
+        manager.handle_signal(
+            Signal(
+                "okx",
+                "BTC-USDT-SWAP",
+                1.0,
+                "buy",
+                0.50,
+                0.20,
+                trailing_stop_activation=0.02,
+                trailing_stop_distance=0.01,
+                trailing_stop_min_profit=0.001,
+                price=100,
+            )
+        )
+        manager.update_price("okx", "BTC-USDT-SWAP", 104)
+        latest = snapshots[-1]
+        self.assertEqual(len(latest.positions), 1)
+        self.assertAlmostEqual(latest.positions[0].trailing_stop_activation, 0.02)
+        self.assertGreater(latest.positions[0].mfe, 0.039)
+
+        rehydrated = PositionManager(config=production_position_manager_config(initial_state=latest))
+        self.assertEqual(len(rehydrated.positions()), 1)
+        self.assertEqual(rehydrated.positions()[0].mfe, latest.positions[0].mfe)
+
     def test_trailing_activation_is_at_least_breakeven(self):
         manager = PositionManager(
             config=production_position_manager_config(

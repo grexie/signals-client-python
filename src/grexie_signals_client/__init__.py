@@ -16,7 +16,7 @@ import json
 import math
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Dict, Iterable, List, Literal, Optional, Protocol, Union
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Literal, Optional, Protocol, Union
 
 SignalsWebSocketToken = str
 Side = Literal["buy", "sell"]
@@ -400,6 +400,8 @@ class PositionManagerConfig:
     instruments: Dict[str, InstrumentConfig] = field(default_factory=dict)
     asset_manager: Optional[AssetManager] = None
     instrument_manager: Optional[InstrumentManager] = None
+    initial_state: Optional["PositionManagerState"] = None
+    persist: Optional[Callable[["PositionManagerState"], None]] = None
 
 
 def production_position_manager_config(**overrides: Any) -> PositionManagerConfig:
@@ -499,6 +501,12 @@ class ClosedTrade:
 
 
 @dataclass
+class PositionManagerState:
+    positions: List[Position] = field(default_factory=list)
+    closed_trades: List[ClosedTrade] = field(default_factory=list)
+
+
+@dataclass
 class InstrumentPositionStats:
     venue: str
     instrument: str
@@ -572,6 +580,7 @@ class PositionManager:
         self.instruments = self.config.instrument_manager or InstrumentManager()
         self._positions: Dict[str, Position] = {}
         self._closed: List[ClosedTrade] = []
+        self._hydrate_state(self.config.initial_state)
 
     async def run(self) -> AsyncIterator[Order]:
         """Consume attached client events and yield order recommendations."""
@@ -586,6 +595,7 @@ class PositionManager:
         if position.leverage <= 0:
             position.leverage = self._min_leverage(_position_key(position.venue, position.instrument))
         self._positions[_position_key(position.venue, position.instrument)] = position
+        self._persist()
 
     def update_position(self, position: Position) -> None:
         self.add_position(position)
@@ -595,7 +605,11 @@ class PositionManager:
         for position in positions:
             if not position.venue or not position.instrument or abs(position.size) <= 1e-9:
                 continue
-            self.add_position(replace(position))
+            copy = replace(position)
+            if copy.leverage <= 0:
+                copy.leverage = self._min_leverage(_position_key(copy.venue, copy.instrument))
+            self._positions[_position_key(copy.venue, copy.instrument)] = copy
+        self._persist()
 
     def close_position(self, venue: str, instrument: str) -> List[Order]:
         key = _position_key(venue, instrument)
@@ -606,6 +620,7 @@ class PositionManager:
         if not self._order_meets_minimum(order):
             return []
         self._apply_delta(key, order.size_delta, position.last_price or position.entry_price, self._taker_fee_rate(key), "closing")
+        self._persist()
         return [order]
 
     def update_price(self, venue: str, instrument: str, price: float, timestamp: Optional[datetime] = None) -> List[Order]:
@@ -619,6 +634,7 @@ class PositionManager:
         _update_excursion(position)
         reason = _exit_reason(position, price)
         if not reason:
+            self._persist()
             return []
         fee_rate = self._maker_fee_rate(key) if reason == "take_profit" else self._taker_fee_rate(key)
         order = self._order_for_delta(key, position, -position.size, 0.0, 0.0, reason, position.confidence)
@@ -626,8 +642,10 @@ class PositionManager:
         order.estimated_fee = _fee_value_for_notional(order.notional, fee_rate)
         order.estimated_fee_value = order.notional * fee_rate
         if not self._order_meets_minimum(order):
+            self._persist()
             return []
         self._apply_delta(key, order.size_delta, price, fee_rate, reason, timestamp or datetime.now(timezone.utc))
+        self._persist()
         return [order]
 
     def positions(self) -> List[Position]:
@@ -635,6 +653,9 @@ class PositionManager:
 
     def closed_trades(self) -> List[ClosedTrade]:
         return list(self._closed)
+
+    def state(self) -> PositionManagerState:
+        return PositionManagerState(self.positions(), [replace(trade) for trade in self._closed])
 
     def stats(self) -> PositionStats:
         stats = PositionStats()
@@ -747,7 +768,7 @@ class PositionManager:
             position.trailing_stop_distance = trailing["distance"]
             position.trailing_stop_min_profit = trailing["min_profit"]
         position.leverage = self._select_leverage(key, target_confidence, edge, signal.score)
-        return self._rebalance(
+        orders = self._rebalance(
             {key: target_sign},
             {
                 key: {
@@ -762,6 +783,25 @@ class PositionManager:
                 }
             },
         )
+        self._persist()
+        return orders
+
+    def _hydrate_state(self, state: Optional[PositionManagerState]) -> None:
+        if state is None:
+            return
+        self._positions = {}
+        for position in state.positions:
+            if not position.venue or not position.instrument or abs(position.size) <= 1e-9:
+                continue
+            copy = replace(position)
+            if copy.leverage <= 0:
+                copy.leverage = self._min_leverage(_position_key(copy.venue, copy.instrument))
+            self._positions[_position_key(copy.venue, copy.instrument)] = copy
+        self._closed = [replace(trade) for trade in state.closed_trades]
+
+    def _persist(self) -> None:
+        if self.config.persist is not None:
+            self.config.persist(self.state())
 
     def _rebalance(self, side_overrides: Dict[str, float], contexts: Dict[str, Dict[str, float]]) -> List[Order]:
         portfolio_budget = self._max_portfolio_margin_budget()
@@ -1603,6 +1643,7 @@ __all__ = [
     "Position",
     "Order",
     "ClosedTrade",
+    "PositionManagerState",
     "PositionStats",
     "InstrumentPositionStats",
     "CurrencyPositionStats",
