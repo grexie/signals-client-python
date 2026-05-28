@@ -204,6 +204,40 @@ class ClientTests(unittest.TestCase):
         self.assertGreater(scored, low)
         self.assertAlmostEqual(high, 5.0)
 
+    def test_update_config_keeps_state_and_changes_leverage(self):
+        manager = PositionManager(
+            config=production_position_manager_config(
+                max_margin_ratio=1.0,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+                rebalance_interval=timedelta(hours=1),
+                min_leverage=5.0,
+                max_leverage=5.0,
+            )
+        )
+        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
+        opening = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, score=1.0, price=100)
+        )
+        self.assertAlmostEqual(opening[0].leverage, 5.0)
+
+        manager.update_config(
+            production_position_manager_config(
+                max_margin_ratio=1.0,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+                rebalance_interval=timedelta(hours=1),
+                min_leverage=1.0,
+                max_leverage=1.0,
+            )
+        )
+        self.assertEqual(len(manager.positions()), 1)
+        closing = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 1.0, "sell", 0.02, 0.004, score=-1.0, price=99)
+        )
+        self.assertTrue(closing[0].reduce_only)
+        self.assertAlmostEqual(closing[0].leverage, 1.0)
+
     def test_asset_and_instrument_managers_create_concrete_orders(self):
         assets = AssetManager()
         assets.update_asset(AssetSnapshot("USDT", cash=1000, available=900, used=100, equity=1000))

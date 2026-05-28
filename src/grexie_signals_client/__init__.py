@@ -582,6 +582,21 @@ class PositionManager:
         self._closed: List[ClosedTrade] = []
         self._hydrate_state(self.config.initial_state)
 
+    def update_config(self, config: PositionManagerConfig) -> None:
+        """Replace manager policy without clearing runtime state."""
+
+        next_config = replace(
+            config,
+            instruments=dict(config.instruments) if config.instruments else dict(self.config.instruments),
+            asset_manager=config.asset_manager or self.assets,
+            instrument_manager=config.instrument_manager or self.instruments,
+            initial_state=None,
+            persist=config.persist or self.config.persist,
+        )
+        self.config = _normalize_config(next_config)
+        self.assets = self.config.asset_manager or self.assets
+        self.instruments = self.config.instrument_manager or self.instruments
+
     async def run(self) -> AsyncIterator[Order]:
         """Consume attached client events and yield order recommendations."""
 
