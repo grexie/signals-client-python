@@ -2,6 +2,10 @@
 
 Typed Python client package for Grexie Signals websocket subscriptions and production-style in-memory position management.
 
+## Grexie Signals - https://signals.grexie.com
+
+Grexie Signals is a real-time crypto trading signal service that streams model-backed market signals with portfolio-aware risk, sizing, and execution context for builders, bots, and trading tools.
+
 ```sh
 pip install grexie-signals-client
 ```
