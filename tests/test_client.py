@@ -8,6 +8,7 @@ from grexie_signals_client import (
     AssetSnapshot,
     InstrumentManager,
     InstrumentMetadata,
+    InstrumentConfig,
     PositionManager,
     Position,
     ReadyEvent,
@@ -46,11 +47,14 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
 class ClientTests(unittest.TestCase):
     def test_parse_signal_replay_event(self):
         event = parse_event(
-            '{"type":"signal","subscriptionId":3,"venue":"okx","instrument":"BTC-USDT-SWAP","timestamp":"2026-05-26T00:00:00Z","replay":true,"signal":{"confidence":0.8,"side":"buy","takeProfit":0.01,"stopLoss":0.004}}'
+            '{"type":"signal","subscriptionId":3,"venue":"okx","instrument":"BTC-USDT-SWAP","timestamp":"2026-05-26T00:00:00Z","replay":true,"signal":{"confidence":0.8,"side":"buy","takeProfit":0.01,"stopLoss":0.004,"trailingStopActivation":0.02,"trailingStopDistance":0.01,"trailingStopMinProfit":0.001}}'
         )
         self.assertIsInstance(event, SignalEvent)
         self.assertEqual(event.signal.venue, "okx")
         self.assertEqual(event.signal.instrument, "BTC-USDT-SWAP")
+        self.assertAlmostEqual(event.signal.trailing_stop_activation, 0.02)
+        self.assertAlmostEqual(event.signal.trailing_stop_distance, 0.01)
+        self.assertAlmostEqual(event.signal.trailing_stop_min_profit, 0.001)
         self.assertTrue(event.replay)
 
     def test_parse_info_and_error_events(self):
@@ -304,6 +308,67 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(orders), 1)
         self.assertLessEqual(order_budget_cost(orders[0]), 50 + 1e-9)
         self.assertLess(orders[0].margin, 50)
+
+    def test_trailing_stop_closes_after_favorable_giveback(self):
+        manager = PositionManager(
+            config=production_position_manager_config(
+                max_margin_ratio=1.0,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+            )
+        )
+        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
+        orders = manager.handle_signal(
+            Signal(
+                "okx",
+                "BTC-USDT-SWAP",
+                1.0,
+                "buy",
+                0.50,
+                0.20,
+                trailing_stop_activation=0.02,
+                trailing_stop_distance=0.01,
+                trailing_stop_min_profit=0.001,
+                price=100,
+            )
+        )
+        self.assertEqual(len(orders), 1)
+        self.assertAlmostEqual(orders[0].trailing_stop_activation, 0.02)
+        self.assertEqual(manager.update_price("okx", "BTC-USDT-SWAP", 103), [])
+
+        close = manager.update_price("okx", "BTC-USDT-SWAP", 101.8)
+        self.assertEqual(len(close), 1)
+        self.assertEqual(close[0].reason, "trailing_stop")
+        self.assertEqual(manager.positions(), [])
+        closed = manager.closed_trades()
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0].exit_reason, "trailing_stop")
+        self.assertGreaterEqual(closed[0].mfe, 0.03 - 1e-9)
+        self.assertGreater(closed[0].realized_pnl, 0)
+
+    def test_trailing_activation_is_at_least_breakeven(self):
+        manager = PositionManager(
+            config=production_position_manager_config(
+                max_margin_ratio=1.0,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+                taker_fee_rate=0.0005,
+                instruments={
+                    "okx:BTC-USDT-SWAP": InstrumentConfig(
+                        trailing_stop_activation=0.0001,
+                        trailing_stop_distance=0.01,
+                    )
+                },
+            )
+        )
+        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
+        orders = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.50, 0.20, price=100)
+        )
+
+        self.assertEqual(len(orders), 1)
+        self.assertAlmostEqual(orders[0].trailing_stop_min_profit, 0.001)
+        self.assertAlmostEqual(orders[0].trailing_stop_activation, 0.002)
 
     def test_caps_openings_to_remaining_portfolio_budget_without_asset_snapshots(self):
         instruments = InstrumentManager()

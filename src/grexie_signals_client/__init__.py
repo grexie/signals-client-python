@@ -46,6 +46,9 @@ class Signal:
     side: Side
     take_profit: float
     stop_loss: float
+    trailing_stop_activation: float = 0.0
+    trailing_stop_distance: float = 0.0
+    trailing_stop_min_profit: float = 0.0
     timeframe: Optional[str] = None
     score: float = 0.0
     components: List[SignalComponent] = field(default_factory=list)
@@ -315,6 +318,9 @@ class InstrumentConfig:
     taker_fee_rate: Optional[float] = None
     min_leverage: Optional[float] = None
     max_leverage: Optional[float] = None
+    trailing_stop_activation: Optional[float] = None
+    trailing_stop_distance: Optional[float] = None
+    trailing_stop_min_profit: Optional[float] = None
 
 
 @dataclass
@@ -414,7 +420,12 @@ class Position:
     last_price: float = 0.0
     take_profit: float = 0.0
     stop_loss: float = 0.0
+    trailing_stop_activation: float = 0.0
+    trailing_stop_distance: float = 0.0
+    trailing_stop_min_profit: float = 0.0
     leverage: float = 1.0
+    mfe: float = 0.0
+    mae: float = 0.0
     realized_gross: float = 0.0
     fees: float = 0.0
     realized_pnl: float = 0.0
@@ -460,6 +471,9 @@ class Order:
     score: float = 0.0
     take_profit: float = 0.0
     stop_loss: float = 0.0
+    trailing_stop_activation: float = 0.0
+    trailing_stop_distance: float = 0.0
+    trailing_stop_min_profit: float = 0.0
     reduce_only: bool = False
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     subscription_id: Optional[int] = None
@@ -474,9 +488,13 @@ class ClosedTrade:
     size: float
     entry_price: float
     exit_price: float
+    exit_move: float
     realized_gross: float
     fees: float
     realized_pnl: float
+    mfe: float
+    mae: float
+    exit_reason: str
     closed_at: datetime
 
 
@@ -587,7 +605,29 @@ class PositionManager:
         order = self._order_for_delta(key, position, -position.size, 0.0, 0.0, "closing", position.confidence)
         if not self._order_meets_minimum(order):
             return []
-        self._apply_delta(key, order.size_delta, position.last_price or position.entry_price, self._taker_fee_rate(key))
+        self._apply_delta(key, order.size_delta, position.last_price or position.entry_price, self._taker_fee_rate(key), "closing")
+        return [order]
+
+    def update_price(self, venue: str, instrument: str, price: float, timestamp: Optional[datetime] = None) -> List[Order]:
+        if price <= 0:
+            raise ValueError("price must be positive")
+        key = _position_key(venue, instrument)
+        position = self._positions.get(key)
+        if position is None or abs(position.size) <= 1e-9:
+            return []
+        position.last_price = price
+        _update_excursion(position)
+        reason = _exit_reason(position, price)
+        if not reason:
+            return []
+        fee_rate = self._maker_fee_rate(key) if reason == "take_profit" else self._taker_fee_rate(key)
+        order = self._order_for_delta(key, position, -position.size, 0.0, 0.0, reason, position.confidence)
+        order.fee_rate = fee_rate
+        order.estimated_fee = _fee_value_for_notional(order.notional, fee_rate)
+        order.estimated_fee_value = order.notional * fee_rate
+        if not self._order_meets_minimum(order):
+            return []
+        self._apply_delta(key, order.size_delta, price, fee_rate, reason, timestamp or datetime.now(timezone.utc))
         return [order]
 
     def positions(self) -> List[Position]:
@@ -681,6 +721,7 @@ class PositionManager:
                 return []
             if position is None:
                 position = Position(signal.venue, signal.instrument, entry_price=signal.price, last_price=signal.price, opened_at=now)
+                _reset_excursion(position)
                 self._positions[key] = position
         else:
             is_flip = _sign(position.size) != 0 and _sign(position.size) != target_sign
@@ -700,10 +741,26 @@ class PositionManager:
         else:
             position.take_profit = _blend_risk(position.take_profit, signal.take_profit, 0.5)
             position.stop_loss = _blend_risk(position.stop_loss, signal.stop_loss, 0.5)
+        trailing = self._trailing_config_for_signal(key, signal)
+        if trailing["activation"] > 0 and trailing["distance"] > 0:
+            position.trailing_stop_activation = trailing["activation"]
+            position.trailing_stop_distance = trailing["distance"]
+            position.trailing_stop_min_profit = trailing["min_profit"]
         position.leverage = self._select_leverage(key, target_confidence, edge, signal.score)
         return self._rebalance(
             {key: target_sign},
-            {key: {"confidence": target_confidence, "score": signal.score, "edge": edge, "take_profit": signal.take_profit, "stop_loss": signal.stop_loss}},
+            {
+                key: {
+                    "confidence": target_confidence,
+                    "score": signal.score,
+                    "edge": edge,
+                    "take_profit": signal.take_profit,
+                    "stop_loss": signal.stop_loss,
+                    "trailing_stop_activation": trailing["activation"],
+                    "trailing_stop_distance": trailing["distance"],
+                    "trailing_stop_min_profit": trailing["min_profit"],
+                }
+            },
         )
 
     def _rebalance(self, side_overrides: Dict[str, float], contexts: Dict[str, Dict[str, float]]) -> List[Order]:
@@ -874,6 +931,9 @@ class PositionManager:
             )
             order.take_profit = context.get("take_profit", 0.0)
             order.stop_loss = context.get("stop_loss", 0.0)
+            order.trailing_stop_activation = context.get("trailing_stop_activation", 0.0)
+            order.trailing_stop_distance = context.get("trailing_stop_distance", 0.0)
+            order.trailing_stop_min_profit = context.get("trailing_stop_min_profit", 0.0)
             if not self._order_meets_minimum(order):
                 if candidate.key in self._positions:
                     self._positions[candidate.key].confidence = candidate.weight
@@ -881,9 +941,19 @@ class PositionManager:
             orders.append(order)
             if cap_openings and not _is_exposure_reduction(order.previous_size, order.target_size):
                 opening_exposure_by_currency[order.settlement_currency] = opening_exposure_by_currency.get(order.settlement_currency, 0.0) + _order_budget_cost(order)
-            self._apply_delta(candidate.key, order.size_delta, candidate.position.last_price or candidate.position.entry_price, self._taker_fee_rate(candidate.key))
+            self._apply_delta(
+                candidate.key,
+                order.size_delta,
+                candidate.position.last_price or candidate.position.entry_price,
+                self._taker_fee_rate(candidate.key),
+                candidate.reason,
+            )
             if candidate.key in self._positions:
                 self._positions[candidate.key].confidence = candidate.weight
+                if order.trailing_stop_activation > 0 and order.trailing_stop_distance > 0:
+                    self._positions[candidate.key].trailing_stop_activation = order.trailing_stop_activation
+                    self._positions[candidate.key].trailing_stop_distance = order.trailing_stop_distance
+                    self._positions[candidate.key].trailing_stop_min_profit = order.trailing_stop_min_profit
         return orders
 
     def _available_exposure_budget(self, currency: str) -> float:
@@ -1108,10 +1178,21 @@ class PositionManager:
             min_size=metadata.min_size,
             lot_size=metadata.lot_size,
             tick_size=metadata.tick_size,
+            trailing_stop_activation=position.trailing_stop_activation,
+            trailing_stop_distance=position.trailing_stop_distance,
+            trailing_stop_min_profit=position.trailing_stop_min_profit,
             reduce_only=_is_exposure_reduction(position.size, position.size + executable_delta),
         )
 
-    def _apply_delta(self, key: str, delta: float, price: float, fee_rate: float) -> None:
+    def _apply_delta(
+        self,
+        key: str,
+        delta: float,
+        price: float,
+        fee_rate: float,
+        reason: str = "",
+        now: Optional[datetime] = None,
+    ) -> None:
         position = self._positions.get(key)
         if position is None:
             return
@@ -1124,16 +1205,33 @@ class PositionManager:
             position.fees += fee
             position.realized_pnl -= fee
             position.size += delta
+            _reset_excursion(position)
             return
         if price > 0:
             position.last_price = price
+            _update_excursion(position)
         closing = min(abs(position.size), abs(delta))
         gross = self._realized_gross_for_quantity(key, position, closing, price)
         fee = self._fee_for_quantity(key, position, closing, price, fee_rate)
         position.realized_gross += gross
         position.fees += fee
         position.realized_pnl += gross - fee
-        closed = ClosedTrade(position.venue, position.instrument, position.side or "buy", closing, position.entry_price, price, position.realized_gross, position.fees, position.realized_pnl, datetime.now(timezone.utc))
+        closed = ClosedTrade(
+            venue=position.venue,
+            instrument=position.instrument,
+            side=position.side or "buy",
+            size=closing,
+            entry_price=position.entry_price,
+            exit_price=price,
+            exit_move=_move(position),
+            realized_gross=position.realized_gross,
+            fees=position.fees,
+            realized_pnl=position.realized_pnl,
+            mfe=position.mfe,
+            mae=position.mae,
+            exit_reason=reason,
+            closed_at=now or datetime.now(timezone.utc),
+        )
         remaining = abs(delta) - closing
         if remaining <= 1e-9:
             position.size += delta
@@ -1149,6 +1247,7 @@ class PositionManager:
         position.realized_gross = 0.0
         position.fees = self._fee_for_quantity(key, position, remaining, price, fee_rate)
         position.realized_pnl = -position.fees
+        _reset_excursion(position)
 
     def _effective_min_order_delta(self) -> float:
         return max(self.config.min_order_delta, 0.0) * self._max_portfolio_margin_budget()
@@ -1190,6 +1289,28 @@ class PositionManager:
         metadata_max = self.instruments.instrument(venue, instrument).max_leverage
         return min(configured, metadata_max) if metadata_max > 0 and configured > 0 else configured
 
+    def _trailing_config_for_signal(self, key: str, signal: Signal) -> Dict[str, float]:
+        override = self.config.instruments.get(key)
+        activation = _positive_or(
+            signal.trailing_stop_activation,
+            override.trailing_stop_activation if override and override.trailing_stop_activation is not None else 0.0,
+        )
+        distance = _positive_or(
+            signal.trailing_stop_distance,
+            override.trailing_stop_distance if override and override.trailing_stop_distance is not None else 0.0,
+        )
+        min_profit = _positive_or(
+            signal.trailing_stop_min_profit,
+            override.trailing_stop_min_profit if override and override.trailing_stop_min_profit is not None else 0.0,
+        )
+        if activation <= 0 or distance <= 0:
+            return {"activation": 0.0, "distance": 0.0, "min_profit": 0.0}
+        fee_floor = 2 * self._taker_fee_rate(key)
+        min_profit = max(min_profit, fee_floor)
+        if activation < min_profit + 1e-9:
+            activation = min_profit + min(distance, fee_floor)
+        return {"activation": activation, "distance": distance, "min_profit": min_profit}
+
     def _order_meets_minimum(self, order: Order) -> bool:
         if order.quantity <= 0:
             return False
@@ -1209,6 +1330,9 @@ def _signal_from_payload(payload: Dict[str, Any]) -> Signal:
         side=payload.get("side", "buy"),
         take_profit=float(payload.get("takeProfit", payload.get("take_profit", 0.0))),
         stop_loss=float(payload.get("stopLoss", payload.get("stop_loss", 0.0))),
+        trailing_stop_activation=float(payload.get("trailingStopActivation", payload.get("trailing_stop_activation", 0.0)) or 0.0),
+        trailing_stop_distance=float(payload.get("trailingStopDistance", payload.get("trailing_stop_distance", 0.0)) or 0.0),
+        trailing_stop_min_profit=float(payload.get("trailingStopMinProfit", payload.get("trailing_stop_min_profit", 0.0)) or 0.0),
         score=float(payload.get("score", 0.0)),
         components=[],
         model_variant=payload.get("modelVariant", payload.get("model_variant")),
@@ -1253,6 +1377,26 @@ def _normalize_config(config: PositionManagerConfig) -> PositionManagerConfig:
     config.max_leverage = max(config.max_leverage, 0.0)
     config.available_margin_buffer = min(max(config.available_margin_buffer, 0.0), 0.95)
     config.executable_margin_buffer = min(max(config.executable_margin_buffer, 0.0), 0.05)
+    for key, instrument in list(config.instruments.items()):
+        config.instruments[key] = _normalize_instrument_config(instrument)
+    return config
+
+
+def _normalize_instrument_config(config: InstrumentConfig) -> InstrumentConfig:
+    if config.maker_fee_rate is not None:
+        config.maker_fee_rate = max(config.maker_fee_rate, 0.0)
+    if config.taker_fee_rate is not None:
+        config.taker_fee_rate = max(config.taker_fee_rate, 0.0)
+    if config.min_leverage is not None:
+        config.min_leverage = max(config.min_leverage, 0.0)
+    if config.max_leverage is not None:
+        config.max_leverage = max(config.max_leverage, 0.0)
+    if config.trailing_stop_activation is not None:
+        config.trailing_stop_activation = max(config.trailing_stop_activation, 0.0)
+    if config.trailing_stop_distance is not None:
+        config.trailing_stop_distance = max(config.trailing_stop_distance, 0.0)
+    if config.trailing_stop_min_profit is not None:
+        config.trailing_stop_min_profit = max(config.trailing_stop_min_profit, 0.0)
     return config
 
 
@@ -1333,6 +1477,65 @@ def _move(position: Position) -> float:
     if position.entry_price <= 0 or position.last_price <= 0:
         return 0.0
     return (position.entry_price - position.last_price) / position.entry_price if position.size < 0 else (position.last_price - position.entry_price) / position.entry_price
+
+
+def _take_profit_price(position: Position) -> float:
+    if position.entry_price <= 0 or position.take_profit <= 0:
+        return 0.0
+    return position.entry_price * (1 - position.take_profit) if position.size < 0 else position.entry_price * (1 + position.take_profit)
+
+
+def _stop_loss_price(position: Position) -> float:
+    if position.entry_price <= 0 or position.stop_loss <= 0:
+        return 0.0
+    return position.entry_price * (1 + position.stop_loss) if position.size < 0 else position.entry_price * (1 - position.stop_loss)
+
+
+def _take_profit_triggered(position: Position, price: float) -> bool:
+    target = _take_profit_price(position)
+    if target <= 0:
+        return False
+    return price <= target if position.size < 0 else price >= target
+
+
+def _stop_loss_triggered(position: Position, price: float) -> bool:
+    target = _stop_loss_price(position)
+    if target <= 0:
+        return False
+    return price >= target if position.size < 0 else price <= target
+
+
+def _trailing_stop_triggered(position: Position) -> bool:
+    if position.trailing_stop_activation <= 0 or position.trailing_stop_distance <= 0:
+        return False
+    if position.mfe + 1e-9 < position.trailing_stop_activation:
+        return False
+    floor = max(position.mfe - position.trailing_stop_distance, position.trailing_stop_min_profit)
+    return _move(position) <= floor + 1e-9
+
+
+def _exit_reason(position: Position, price: float) -> str:
+    if price <= 0:
+        return ""
+    if _take_profit_triggered(position, price):
+        return "take_profit"
+    if _stop_loss_triggered(position, price):
+        return "stop_loss"
+    if _trailing_stop_triggered(position):
+        return "trailing_stop"
+    return ""
+
+
+def _reset_excursion(position: Position) -> None:
+    move = _move(position)
+    position.mfe = max(move, 0.0)
+    position.mae = min(move, 0.0)
+
+
+def _update_excursion(position: Position) -> None:
+    move = _move(position)
+    position.mfe = max(position.mfe, move)
+    position.mae = min(position.mae, move)
 
 
 def _order_reason(position: Position, target_size: float) -> str:
