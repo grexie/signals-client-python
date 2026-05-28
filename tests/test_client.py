@@ -47,7 +47,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
 class ClientTests(unittest.TestCase):
     def test_parse_signal_replay_event(self):
         event = parse_event(
-            '{"type":"signal","subscriptionId":3,"venue":"okx","instrument":"BTC-USDT-SWAP","timestamp":"2026-05-26T00:00:00Z","replay":true,"signal":{"confidence":0.8,"side":"buy","takeProfit":0.01,"stopLoss":0.004,"trailingStopActivation":0.02,"trailingStopDistance":0.01,"trailingStopMinProfit":0.001}}'
+            '{"type":"signal","subscriptionId":3,"venue":"okx","instrument":"BTC-USDT-SWAP","timestamp":"2026-05-26T00:00:00Z","replay":true,"signal":{"confidence":0.8,"side":"buy","takeProfit":0.01,"stopLoss":0.004,"trailingStopActivation":0.02,"trailingStopDistance":0.01,"trailingStopMinProfit":0.001,"managePositionsOnly":true}}'
         )
         self.assertIsInstance(event, SignalEvent)
         self.assertEqual(event.signal.venue, "okx")
@@ -55,6 +55,7 @@ class ClientTests(unittest.TestCase):
         self.assertAlmostEqual(event.signal.trailing_stop_activation, 0.02)
         self.assertAlmostEqual(event.signal.trailing_stop_distance, 0.01)
         self.assertAlmostEqual(event.signal.trailing_stop_min_profit, 0.001)
+        self.assertTrue(event.signal.manage_positions_only)
         self.assertTrue(event.replay)
 
     def test_parse_info_and_error_events(self):
@@ -117,6 +118,46 @@ class ClientTests(unittest.TestCase):
         )
         self.assertEqual(len(accepted), 1)
         self.assertAlmostEqual(order_budget_cost(accepted[0]), 0.10)
+
+    def test_manage_positions_only_does_not_open_or_increase_exposure(self):
+        manager = PositionManager(
+            config=production_position_manager_config(
+                max_margin_ratio=0.10,
+                min_expected_edge=0.01,
+                min_order_delta=0.0,
+                max_leverage=5.0,
+            )
+        )
+        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
+        blocked_open = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.9, "buy", 0.02, 0.004, price=100.0, manage_positions_only=True)
+        )
+        self.assertEqual(blocked_open, [])
+        self.assertEqual(manager.positions(), [])
+
+        opened = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.7, "buy", 0.02, 0.004, price=100.0)
+        )
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0].reason, "opening")
+
+        same_side = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100.0, manage_positions_only=True)
+        )
+        self.assertEqual(same_side, [])
+
+        closed = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.51, "sell", 0.02, 0.004, price=99.0, manage_positions_only=True)
+        )
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0].reason, "closing")
+        self.assertAlmostEqual(closed[0].target_size, 0.0)
+
+        blocked_short = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.51, "sell", 0.02, 0.004, price=99.0, manage_positions_only=True)
+        )
+        self.assertEqual(blocked_short, [])
+        self.assertEqual(manager.positions(), [])
 
     def test_quantizes_emitted_target_size_to_executable_lots(self):
         assets = AssetManager()

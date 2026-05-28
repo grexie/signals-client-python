@@ -72,6 +72,7 @@ class Signal:
     artifact_id: Optional[str] = None
     artifact_version: Optional[str] = None
     rejected_reason: Optional[str] = None
+    manage_positions_only: bool = False
     timestamp: Optional[datetime] = None
     price: float = 0.0
 
@@ -559,7 +560,7 @@ class _RebalanceCandidate:
     position: Position
     delta: float
     weight: float
-    context: Dict[str, float]
+    context: Dict[str, Any]
     reason: str
 
 
@@ -746,13 +747,15 @@ class PositionManager:
         if target_sign == 0 or target_confidence <= 0:
             return []
         edge = _fee_adjusted_expected_edge(signal, self._taker_fee_rate(key))
-        if self.config.min_expected_edge > 0 and edge < self.config.min_expected_edge:
+        if self.config.min_expected_edge > 0 and edge < self.config.min_expected_edge and not signal.manage_positions_only:
             return []
         now = signal.timestamp or datetime.now(timezone.utc)
         portfolio_budget = self._max_portfolio_margin_budget()
         min_delta = self._effective_min_order_delta()
         position = self._positions.get(key)
         if position is None or abs(position.size) <= 1e-9:
+            if signal.manage_positions_only:
+                return []
             if portfolio_budget < min_delta or not self._meets_minimum_position_size(portfolio_budget):
                 return []
             if position is None:
@@ -765,7 +768,16 @@ class PositionManager:
             if not is_flip and not below_minimum and self.config.rebalance_interval and position.last_signal_at:
                 if now < position.last_signal_at + self.config.rebalance_interval:
                     return []
-        position.confidence = target_confidence
+        if signal.manage_positions_only and _sign(position.size) == 0:
+            return []
+        context_confidence = target_confidence
+        override_side = target_sign
+        if signal.manage_positions_only:
+            if _sign(position.size) != target_sign:
+                override_side = 0.0
+            else:
+                context_confidence = min(context_confidence, _clamp01(position.confidence))
+        position.confidence = context_confidence
         position.last_signal_at = now
         if signal.price > 0:
             position.last_price = signal.price
@@ -782,12 +794,12 @@ class PositionManager:
             position.trailing_stop_activation = trailing["activation"]
             position.trailing_stop_distance = trailing["distance"]
             position.trailing_stop_min_profit = trailing["min_profit"]
-        position.leverage = self._select_leverage(key, target_confidence, edge, signal.score)
+        position.leverage = self._select_leverage(key, context_confidence, edge, signal.score)
         orders = self._rebalance(
-            {key: target_sign},
+            {key: override_side},
             {
                 key: {
-                    "confidence": target_confidence,
+                    "confidence": context_confidence,
                     "score": signal.score,
                     "edge": edge,
                     "take_profit": signal.take_profit,
@@ -795,6 +807,7 @@ class PositionManager:
                     "trailing_stop_activation": trailing["activation"],
                     "trailing_stop_distance": trailing["distance"],
                     "trailing_stop_min_profit": trailing["min_profit"],
+                    "manage_positions_only": signal.manage_positions_only,
                 }
             },
         )
@@ -845,6 +858,9 @@ class PositionManager:
                     position.confidence = weights.get(key, 0.0)
                     continue
                 target_size = 0.0
+            context = contexts.get(key, {})
+            if context.get("manage_positions_only"):
+                target_size = _manage_positions_only_target_size(position.size, target_size)
             delta = target_size - position.size
             if _is_flip_target(position.size, target_size):
                 delta = -position.size
@@ -857,7 +873,6 @@ class PositionManager:
             if not (is_flip or is_opening or is_closing) and self._margin_for_quantity(key, position, delta) < self._effective_min_order_delta():
                 position.confidence = weights.get(key, 0.0)
                 continue
-            context = contexts.get(key, {})
             candidate = _RebalanceCandidate(
                 key,
                 replace(position),
@@ -962,6 +977,10 @@ class PositionManager:
         opening_exposure_by_currency: Dict[str, float] = {}
         for candidate in candidates:
             delta = candidate.delta
+            if candidate.context.get("manage_positions_only") and not _is_exposure_reduction(candidate.position.size, candidate.position.size + delta):
+                if candidate.key in self._positions:
+                    self._positions[candidate.key].confidence = candidate.weight
+                continue
             if cap_openings and not _is_exposure_reduction(candidate.position.size, candidate.position.size + delta):
                 metadata = self.instruments.instrument(candidate.position.venue, candidate.position.instrument)
                 available = self._available_exposure_budget(metadata.settlement_currency) - opening_exposure_by_currency.get(metadata.settlement_currency, 0.0)
@@ -1410,6 +1429,7 @@ def _signal_from_payload(payload: Dict[str, Any]) -> Signal:
         artifact_id=payload.get("artifactID", payload.get("artifact_id")),
         artifact_version=payload.get("artifactVersion", payload.get("artifact_version")),
         rejected_reason=payload.get("rejectedReason", payload.get("rejected_reason")),
+        manage_positions_only=bool(payload.get("managePositionsOnly", payload.get("manage_positions_only", False))),
         timestamp=_parse_time(payload.get("timestamp")),
         price=float(payload.get("price", 0.0) or 0.0),
     )
@@ -1605,6 +1625,18 @@ def _order_reason(position: Position, target_size: float) -> str:
 
 def _is_flip_target(previous_size: float, target_size: float) -> bool:
     return abs(previous_size) > 1e-9 and abs(target_size) > 1e-9 and _sign(previous_size) != _sign(target_size)
+
+
+def _manage_positions_only_target_size(previous_size: float, target_size: float) -> float:
+    if abs(previous_size) <= 1e-9:
+        return 0.0
+    if abs(target_size) <= 1e-9:
+        return 0.0
+    if _sign(previous_size) != _sign(target_size):
+        return 0.0
+    if abs(target_size) > abs(previous_size):
+        return previous_size
+    return target_size
 
 
 def _is_exposure_reduction(previous_size: float, target_size: float) -> bool:
