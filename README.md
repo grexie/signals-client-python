@@ -72,6 +72,21 @@ Use `add_position`, `update_position`, `replace_positions`, and `close_position`
 
 Call `manager.stats()` for realized and unrealized PnL in account value and percent, grouped by instrument and settlement currency.
 
+## signalsbot Paper Trader Example
+
+The `examples/signalsbot` directory contains a command-line paper trader that reads `.env`, subscribes to `SIGNALS_INSTRUMENTS`, consumes OKX candles, connects with `SIGNALS_WEBSOCKET_TOKEN`, and persists the position manager `initial_state`/`persist` workflow to SQLite.
+
+```sh
+cd examples/signalsbot
+cp .env.example .env
+PYTHONPATH=../../src python3 -m signalsbot papertrader
+PYTHONPATH=../../src python3 -m signalsbot clean
+docker compose up --build
+docker compose run --rm signalsbot clean
+```
+
+Set `SIGNALS_WEBSOCKET_URL` to override `wss://signals.grexie.com/ws`. Docker Compose stores the local database in the `signalsbot-data` volume.
+
 ## Development
 
 ```sh
