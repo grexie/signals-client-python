@@ -392,6 +392,8 @@ class PositionManagerConfig:
     min_order_delta: float = 0.20
     min_position_size_ratio: float = 0.01
     rebalance_interval: timedelta = timedelta(hours=6)
+    flip_flop_window: timedelta = timedelta(minutes=30)
+    signal_flip_min_confidence: float = 0.0
     maker_fee_rate: float = 0.0002
     taker_fee_rate: float = 0.0005
     min_leverage: float = 1.0
@@ -765,6 +767,8 @@ class PositionManager:
         else:
             is_flip = _sign(position.size) != 0 and _sign(position.size) != target_sign
             below_minimum = not self._meets_minimum_position_size(self._position_margin(key, position))
+            if is_flip and self._should_suppress_flip_flop(position, signal, now):
+                return []
             if not is_flip and not below_minimum and self.config.rebalance_interval and position.last_signal_at:
                 if now < position.last_signal_at + self.config.rebalance_interval:
                     return []
@@ -813,6 +817,15 @@ class PositionManager:
         )
         self._persist()
         return orders
+
+    def _should_suppress_flip_flop(self, position: Position, signal: Signal, now: datetime) -> bool:
+        if signal.manage_positions_only:
+            return False
+        if position.last_signal_at is None or self.config.flip_flop_window <= timedelta(0):
+            return False
+        if now >= position.last_signal_at + self.config.flip_flop_window:
+            return False
+        return self.config.signal_flip_min_confidence <= 0 or signal.confidence + 1e-12 < self.config.signal_flip_min_confidence
 
     def _hydrate_state(self, state: Optional[PositionManagerState]) -> None:
         if state is None:
@@ -1446,6 +1459,9 @@ def _normalize_config(config: PositionManagerConfig) -> PositionManagerConfig:
     config.min_expected_edge = max(config.min_expected_edge, 0.0)
     config.min_order_delta = min(max(config.min_order_delta, 0.0), 1.0)
     config.min_position_size_ratio = min(max(config.min_position_size_ratio, 0.0), 1.0)
+    if config.flip_flop_window < timedelta(0):
+        config.flip_flop_window = timedelta(0)
+    config.signal_flip_min_confidence = min(max(config.signal_flip_min_confidence, 0.0), 1.0)
     config.maker_fee_rate = max(config.maker_fee_rate, 0.0)
     config.taker_fee_rate = max(config.taker_fee_rate, 0.0)
     config.min_leverage = max(config.min_leverage, 0.0)

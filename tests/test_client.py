@@ -77,6 +77,7 @@ class ClientTests(unittest.TestCase):
                 max_margin_ratio=0.10,
                 min_expected_edge=0.0,
                 min_order_delta=0.20,
+                flip_flop_window=timedelta(0),
                 max_leverage=5.0,
             )
         )
@@ -103,6 +104,56 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(open_short), 1)
         self.assertEqual(open_short[0].side, "sell")
         self.assertEqual(open_short[0].reason, "opening")
+
+    def test_position_manager_suppresses_flip_flop_by_default(self):
+        start = datetime(2026, 5, 26, tzinfo=timezone.utc)
+        manager = PositionManager(
+            config=production_position_manager_config(
+                max_margin_ratio=0.10,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+            )
+        )
+        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
+        opened = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.8, "buy", 0.02, 0.004, price=100.0, timestamp=start)
+        )
+        self.assertEqual(len(opened), 1)
+        strong = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.99, "sell", 0.02, 0.004, price=99.95, timestamp=start + timedelta(minutes=5))
+        )
+        self.assertEqual(strong, [])
+        outside_window = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.99, "sell", 0.02, 0.004, price=99.95, timestamp=start + timedelta(minutes=31))
+        )
+        self.assertEqual(len(outside_window), 1)
+        self.assertEqual(outside_window[0].reason, "flip")
+
+    def test_position_manager_allows_explicit_high_confidence_flip_threshold(self):
+        start = datetime(2026, 5, 26, tzinfo=timezone.utc)
+        manager = PositionManager(
+            config=production_position_manager_config(
+                max_margin_ratio=0.10,
+                min_expected_edge=0.0,
+                min_order_delta=0.0,
+                flip_flop_window=timedelta(minutes=30),
+                signal_flip_min_confidence=0.72,
+            )
+        )
+        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
+        opened = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.8, "buy", 0.02, 0.004, price=100.0, timestamp=start)
+        )
+        self.assertEqual(len(opened), 1)
+        weak = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.70, "sell", 0.02, 0.004, price=99.95, timestamp=start + timedelta(minutes=5))
+        )
+        self.assertEqual(weak, [])
+        strong = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 0.72, "sell", 0.02, 0.004, price=99.95, timestamp=start + timedelta(minutes=6))
+        )
+        self.assertEqual(len(strong), 1)
+        self.assertEqual(strong[0].reason, "flip")
 
     def test_confidence_is_allocation_weight(self):
         manager = PositionManager(
@@ -252,6 +303,7 @@ class ClientTests(unittest.TestCase):
                 min_expected_edge=0.0,
                 min_order_delta=0.0,
                 rebalance_interval=timedelta(hours=1),
+                flip_flop_window=timedelta(0),
                 min_leverage=5.0,
                 max_leverage=5.0,
             )
@@ -268,6 +320,7 @@ class ClientTests(unittest.TestCase):
                 min_expected_edge=0.0,
                 min_order_delta=0.0,
                 rebalance_interval=timedelta(hours=1),
+                flip_flop_window=timedelta(0),
                 min_leverage=1.0,
                 max_leverage=1.0,
             )
