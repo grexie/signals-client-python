@@ -374,6 +374,10 @@ class InstrumentManager:
         if metadata.venue and metadata.instrument:
             self._instruments[_position_key(metadata.venue, metadata.instrument)] = metadata
 
+    def remove_instrument(self, venue: str, instrument: str) -> None:
+        if venue and instrument:
+            self._instruments.pop(_position_key(venue, instrument), None)
+
     def instrument(self, venue: str, instrument: str) -> InstrumentMetadata:
         return self._instruments.get(_position_key(venue, instrument), InstrumentMetadata(venue, instrument))
 

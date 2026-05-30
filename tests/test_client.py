@@ -129,6 +129,17 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(outside_window), 1)
         self.assertEqual(outside_window[0].reason, "flip")
 
+    def test_position_manager_ignores_signals_after_instrument_removed(self):
+        manager = PositionManager(config=production_position_manager_config())
+        manager.assets.update_asset(AssetSnapshot("USDT", available=1000.0, equity=1000.0))
+        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
+        manager.instruments.remove_instrument("okx", "BTC-USDT-SWAP")
+        orders = manager.handle_signal(
+            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.03, 0.01, price=100.0, score=1.0)
+        )
+        self.assertEqual(orders, [])
+        self.assertFalse(manager.instruments.has_instrument("okx", "BTC-USDT-SWAP"))
+
     def test_position_manager_allows_explicit_high_confidence_flip_threshold(self):
         start = datetime(2026, 5, 26, tzinfo=timezone.utc)
         manager = PositionManager(

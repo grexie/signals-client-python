@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "grexie-signals-client"
-version = "0.1.17"
+version = "0.1.18"
 description = "Typed Python client for Grexie Signals websocket subscriptions and position management."
 readme = "README.md"
 requires-python = ">=3.9"
