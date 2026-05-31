@@ -127,13 +127,69 @@ class SignalEvent:
 
 
 @dataclass
+class CreateMarketOrderEvent:
+    type: Literal["create-market-order"]
+    subscription_id: int
+    intent_id: Optional[str]
+    action: Optional[str]
+    venue: Optional[str]
+    instrument: str
+    side: str
+    order_type: Optional[str] = None
+    contract_size: float = 0.0
+    leverage: float = 0.0
+    reduce_only: bool = False
+    take_profit_price: float = 0.0
+    stop_loss_price: float = 0.0
+    take_profit: float = 0.0
+    stop_loss: float = 0.0
+    timestamp: Optional[datetime] = None
+
+
+@dataclass
+class UpdateTPSLEvent:
+    type: Literal["update-tpsl"]
+    subscription_id: int
+    intent_id: Optional[str]
+    venue: Optional[str]
+    instrument: str
+    side: str
+    take_profit_price: float = 0.0
+    stop_loss_price: float = 0.0
+    take_profit: float = 0.0
+    stop_loss: float = 0.0
+    timestamp: Optional[datetime] = None
+
+
+@dataclass
+class WithdrawEvent:
+    type: Literal["withdraw"]
+    subscription_id: int
+    intent_id: Optional[str]
+    venue: Optional[str]
+    currency: str
+    amount: float
+    timestamp: Optional[datetime] = None
+
+
+@dataclass
 class ErrorEvent:
     type: Literal["error"]
     code: Optional[str] = None
     message: Optional[str] = None
 
 
-SignalsEvent = Union[ReadyEvent, SubscribedEvent, UnsubscribedEvent, InfoEvent, SignalEvent, ErrorEvent]
+SignalsEvent = Union[
+    ReadyEvent,
+    SubscribedEvent,
+    UnsubscribedEvent,
+    InfoEvent,
+    SignalEvent,
+    CreateMarketOrderEvent,
+    UpdateTPSLEvent,
+    WithdrawEvent,
+    ErrorEvent,
+]
 
 
 def parse_event(raw: Union[str, bytes, Dict[str, Any]]) -> SignalsEvent:
@@ -181,6 +237,49 @@ def parse_event(raw: Union[str, bytes, Dict[str, Any]]) -> SignalsEvent:
             _parse_time(msg.get("timestamp")),
             bool(msg.get("replay", False)),
             _parse_time(msg.get("replayedAt")),
+        )
+    if event_type == "create-market-order":
+        return CreateMarketOrderEvent(
+            "create-market-order",
+            int(msg.get("subscriptionId", 0)),
+            msg.get("intentId"),
+            msg.get("action"),
+            msg.get("venue"),
+            msg.get("instrument", ""),
+            msg.get("side", ""),
+            msg.get("orderType"),
+            float(msg.get("contractSize", 0.0) or 0.0),
+            float(msg.get("leverage", 0.0) or 0.0),
+            bool(msg.get("reduceOnly", False)),
+            float(msg.get("takeProfitPrice", 0.0) or 0.0),
+            float(msg.get("stopLossPrice", 0.0) or 0.0),
+            float(msg.get("takeProfit", 0.0) or 0.0),
+            float(msg.get("stopLoss", 0.0) or 0.0),
+            _parse_time(msg.get("timestamp")),
+        )
+    if event_type == "update-tpsl":
+        return UpdateTPSLEvent(
+            "update-tpsl",
+            int(msg.get("subscriptionId", 0)),
+            msg.get("intentId"),
+            msg.get("venue"),
+            msg.get("instrument", ""),
+            msg.get("side", ""),
+            float(msg.get("takeProfitPrice", msg.get("take_profit_price", 0.0)) or 0.0),
+            float(msg.get("stopLossPrice", msg.get("stop_loss_price", 0.0)) or 0.0),
+            float(msg.get("takeProfit", msg.get("take_profit", 0.0)) or 0.0),
+            float(msg.get("stopLoss", msg.get("stop_loss", 0.0)) or 0.0),
+            _parse_time(msg.get("timestamp")),
+        )
+    if event_type == "withdraw":
+        return WithdrawEvent(
+            "withdraw",
+            int(msg.get("subscriptionId", 0)),
+            msg.get("intentId"),
+            msg.get("venue"),
+            msg.get("currency", ""),
+            float(msg.get("amount", 0.0) or 0.0),
+            _parse_time(msg.get("timestamp")),
         )
     if event_type == "error":
         return ErrorEvent("error", msg.get("code"), msg.get("message"))
@@ -236,6 +335,58 @@ class SignalsClient:
         """Subscribe to one venue/instrument pair."""
 
         await self._send({"type": "subscribe", "venue": venue, "instrument": instrument})
+
+    async def subscribe_basket(
+        self,
+        *,
+        venue: str,
+        instruments: List[str],
+        mode: str = "",
+        risk: Optional[Dict[str, Any]] = None,
+        profit_withdraw_ratio: float = 0.0,
+        assets: Optional[List["AssetSnapshot"]] = None,
+        positions: Optional[List["Position"]] = None,
+    ) -> None:
+        """Subscribe to one Bollinger-router basket."""
+
+        payload: Dict[str, Any] = {
+            "type": "subscribe",
+            "venue": venue,
+            "instruments": instruments,
+        }
+        if mode:
+            payload["mode"] = mode
+        if risk:
+            payload["risk"] = risk
+        if profit_withdraw_ratio > 0:
+            payload["profitWithdrawRatio"] = profit_withdraw_ratio
+        if assets:
+            payload["assets"] = [_asset_payload(asset) for asset in assets]
+        if positions:
+            payload["positions"] = [_position_payload(position) for position in positions]
+        await self._send(payload)
+
+    async def update_asset(self, subscription_id: int, asset: "AssetSnapshot") -> None:
+        """Publish an asset/currency snapshot for an active basket."""
+
+        await self._send({"type": "update-asset", "subscriptionId": subscription_id, **_asset_payload(asset)})
+
+    async def update_position(self, subscription_id: int, position: "Position") -> None:
+        """Publish a venue position snapshot for an active basket."""
+
+        await self._send({"type": "update-position", "subscriptionId": subscription_id, **_position_payload(position)})
+
+    async def add_instrument(self, subscription_id: int, instrument: str) -> None:
+        await self._send({"type": "add-instrument", "subscriptionId": subscription_id, "instrument": instrument})
+
+    async def remove_instrument(self, subscription_id: int, instrument: str) -> None:
+        await self._send({"type": "remove-instrument", "subscriptionId": subscription_id, "instrument": instrument})
+
+    async def update_config(self, subscription_id: int, *, profit_withdraw_ratio: float = 0.0) -> None:
+        await self._send({"type": "update-config", "subscriptionId": subscription_id, "profitWithdrawRatio": profit_withdraw_ratio})
+
+    async def schedule_withdrawal(self, subscription_id: int, *, currency: str, amount: float, venue: str = "", reason: str = "") -> None:
+        await self._send({"type": "schedule-withdrawal", "subscriptionId": subscription_id, "venue": venue, "currency": currency, "amount": amount, "reason": reason})
 
     async def unsubscribe(self, subscription_id: int) -> None:
         """Unsubscribe by server subscription id."""
@@ -327,10 +478,12 @@ class InstrumentConfig:
 @dataclass
 class AssetSnapshot:
     currency: str
+    venue: str = ""
     cash: float = 0.0
     available: float = 0.0
     used: float = 0.0
     equity: float = 0.0
+    max_usage: float = 1.0
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -429,6 +582,8 @@ class Position:
     last_price: float = 0.0
     take_profit: float = 0.0
     stop_loss: float = 0.0
+    take_profit_price: float = 0.0
+    stop_loss_price: float = 0.0
     trailing_stop_activation: float = 0.0
     trailing_stop_distance: float = 0.0
     trailing_stop_min_profit: float = 0.0
@@ -440,6 +595,7 @@ class Position:
     realized_pnl: float = 0.0
     opened_at: Optional[datetime] = None
     last_signal_at: Optional[datetime] = None
+    status: str = ""
 
     @property
     def side(self) -> Optional[Side]:
@@ -1054,7 +1210,7 @@ class PositionManager:
             return portfolio_budget
         if asset.available <= 0:
             return 0.0
-        budget = max(0.0, asset.available)
+        budget = max(0.0, asset.available) * min(max(asset.max_usage or 1.0, 0.0), 1.0)
         if self.config.available_margin_buffer > 0:
             budget *= 1 - self.config.available_margin_buffer
         return min(budget, portfolio_budget)
@@ -1575,12 +1731,16 @@ def _move(position: Position) -> float:
 
 
 def _take_profit_price(position: Position) -> float:
+    if position.take_profit_price > 0:
+        return position.take_profit_price
     if position.entry_price <= 0 or position.take_profit <= 0:
         return 0.0
     return position.entry_price * (1 - position.take_profit) if position.size < 0 else position.entry_price * (1 + position.take_profit)
 
 
 def _stop_loss_price(position: Position) -> float:
+    if position.stop_loss_price > 0:
+        return position.stop_loss_price
     if position.entry_price <= 0 or position.stop_loss <= 0:
         return 0.0
     return position.entry_price * (1 + position.stop_loss) if position.size < 0 else position.entry_price * (1 - position.stop_loss)
@@ -1686,6 +1846,33 @@ def _parse_time(value: Any) -> Optional[datetime]:
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
+def _asset_payload(asset: AssetSnapshot) -> Dict[str, Any]:
+    return {
+        "venue": asset.venue,
+        "currency": asset.currency,
+        "cash": asset.cash,
+        "available": asset.available,
+        "used": asset.used,
+        "equity": asset.equity,
+        "maxUsage": asset.max_usage,
+    }
+
+
+def _position_payload(position: Position) -> Dict[str, Any]:
+    return {
+        "venue": position.venue,
+        "instrument": position.instrument,
+        "side": position.side or "",
+        "status": position.status,
+        "size": abs(position.size),
+        "entryPrice": position.entry_price,
+        "markPrice": position.last_price,
+        "leverage": position.leverage,
+        "takeProfitPrice": position.take_profit_price,
+        "stopLossPrice": position.stop_loss_price,
+    }
+
+
 __all__ = [
     "SignalsWebSocketToken",
     "Side",
@@ -1696,6 +1883,9 @@ __all__ = [
     "UnsubscribedEvent",
     "InfoEvent",
     "SignalEvent",
+    "CreateMarketOrderEvent",
+    "UpdateTPSLEvent",
+    "WithdrawEvent",
     "ErrorEvent",
     "SignalsEvent",
     "SignalEventSource",

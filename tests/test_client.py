@@ -17,6 +17,8 @@ from grexie_signals_client import (
     SignalEvent,
     InfoEvent,
     ErrorEvent,
+    UpdateTPSLEvent,
+    WithdrawEvent,
     parse_event,
     production_position_manager_config,
 )
@@ -70,6 +72,21 @@ class ClientTests(unittest.TestCase):
         error = parse_event('{"type":"error","code":"forbidden","message":"no access"}')
         self.assertIsInstance(error, ErrorEvent)
         self.assertEqual(error.code, "forbidden")
+
+    def test_parse_order_router_events(self):
+        tpsl = parse_event(
+            '{"type":"update-tpsl","subscriptionId":12,"intentId":"intent_2","venue":"okx","instrument":"BTC-USDT-SWAP","side":"buy","takeProfitPrice":72100,"stopLossPrice":70050,"takeProfit":0.03,"stopLoss":0.0007}'
+        )
+        self.assertIsInstance(tpsl, UpdateTPSLEvent)
+        self.assertEqual(tpsl.take_profit_price, 72100)
+        self.assertEqual(tpsl.stop_loss_price, 70050)
+
+        withdraw = parse_event(
+            '{"type":"withdraw","subscriptionId":12,"intentId":"withdraw_1","venue":"okx","currency":"USDT","amount":42}'
+        )
+        self.assertIsInstance(withdraw, WithdrawEvent)
+        self.assertEqual(withdraw.currency, "USDT")
+        self.assertEqual(withdraw.amount, 42)
 
     def test_position_manager_opens_and_flips(self):
         manager = PositionManager(
