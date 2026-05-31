@@ -115,6 +115,16 @@ class InfoEvent:
 
 
 @dataclass
+class BacktestEvent:
+    type: Literal["backtest"]
+    subscription_id: int
+    venue: str
+    instrument: str
+    backtest: Dict[str, Any]
+    timestamp: Optional[datetime] = None
+
+
+@dataclass
 class SignalEvent:
     type: Literal["signal"]
     subscription_id: int
@@ -185,6 +195,7 @@ SignalsEvent = Union[
     SubscribedEvent,
     UnsubscribedEvent,
     InfoEvent,
+    BacktestEvent,
     SignalEvent,
     CreateMarketOrderEvent,
     UpdateTPSLEvent,
@@ -222,6 +233,16 @@ def parse_event(raw: Union[str, bytes, Dict[str, Any]]) -> SignalsEvent:
             _parse_time(msg.get("timestamp")),
             bool(msg.get("replay", False)),
             _parse_time(msg.get("replayedAt")),
+        )
+    if event_type == "backtest":
+        payload = msg.get("backtest")
+        return BacktestEvent(
+            "backtest",
+            int(msg.get("subscriptionId", 0)),
+            msg.get("venue", ""),
+            msg.get("instrument", ""),
+            dict(payload or {}) if isinstance(payload, dict) else {},
+            _parse_time(msg.get("timestamp")),
         )
     if event_type == "signal":
         payload = dict(msg.get("signal") or {})
@@ -1884,6 +1905,7 @@ __all__ = [
     "SubscribedEvent",
     "UnsubscribedEvent",
     "InfoEvent",
+    "BacktestEvent",
     "SignalEvent",
     "CreateMarketOrderEvent",
     "UpdateTPSLEvent",

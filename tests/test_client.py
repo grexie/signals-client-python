@@ -10,6 +10,7 @@ from grexie_signals_client import (
     InstrumentMetadata,
     InstrumentConfig,
     CreateMarketOrderEvent,
+    BacktestEvent,
     PositionManager,
     Position,
     ReadyEvent,
@@ -69,6 +70,12 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(info.stage, "ready")
         self.assertTrue(info.replay)
         self.assertIsNotNone(info.replayed_at)
+
+        backtest = parse_event(
+            '{"type":"backtest","subscriptionId":3,"venue":"okx","instrument":"BASKET:1","timestamp":"2026-05-31T17:00:00Z","backtest":{"accepted":true,"candidate":{"total":0.12}}}'
+        )
+        self.assertIsInstance(backtest, BacktestEvent)
+        self.assertTrue(backtest.backtest["accepted"])
 
         error = parse_event('{"type":"error","code":"forbidden","message":"no access"}')
         self.assertIsInstance(error, ErrorEvent)
