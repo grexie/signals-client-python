@@ -132,6 +132,7 @@ class CreateMarketOrderEvent:
     subscription_id: int
     intent_id: Optional[str]
     action: Optional[str]
+    reason: Optional[str]
     venue: Optional[str]
     instrument: str
     side: str
@@ -244,6 +245,7 @@ def parse_event(raw: Union[str, bytes, Dict[str, Any]]) -> SignalsEvent:
             int(msg.get("subscriptionId", 0)),
             msg.get("intentId"),
             msg.get("action"),
+            msg.get("reason"),
             msg.get("venue"),
             msg.get("instrument", ""),
             msg.get("side", ""),

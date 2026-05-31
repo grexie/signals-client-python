@@ -9,6 +9,7 @@ from grexie_signals_client import (
     InstrumentManager,
     InstrumentMetadata,
     InstrumentConfig,
+    CreateMarketOrderEvent,
     PositionManager,
     Position,
     ReadyEvent,
@@ -74,6 +75,12 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(error.code, "forbidden")
 
     def test_parse_order_router_events(self):
+        order = parse_event(
+            '{"type":"create-market-order","subscriptionId":12,"intentId":"intent_1","reason":"preempted_by_better_route","venue":"okx","instrument":"BTC-USDT-SWAP","side":"buy","contractSize":3}'
+        )
+        self.assertIsInstance(order, CreateMarketOrderEvent)
+        self.assertEqual(order.reason, "preempted_by_better_route")
+
         tpsl = parse_event(
             '{"type":"update-tpsl","subscriptionId":12,"intentId":"intent_2","venue":"okx","instrument":"BTC-USDT-SWAP","side":"buy","takeProfitPrice":72100,"stopLossPrice":70050,"takeProfit":0.03,"stopLoss":0.0007}'
         )
