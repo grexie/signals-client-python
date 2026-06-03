@@ -102,12 +102,18 @@ class ClientTests(unittest.TestCase):
 
     def test_parse_info_and_error_events(self):
         info = parse_event(
-            '{"type":"info","subscriptionId":3,"venue":"okx","instrument":"DOGE-USDT-SWAP","stage":"ready","message":"ready","replay":true,"replayedAt":"2026-05-26T00:00:01Z"}'
+            '{"type":"info","subscriptionId":3,"venue":"okx","instrument":"DOGE-USDT-SWAP","level":"debug","stage":"ready","message":"ready","replay":true,"replayedAt":"2026-05-26T00:00:01Z"}'
         )
         self.assertIsInstance(info, InfoEvent)
+        self.assertEqual(info.level, "debug")
         self.assertEqual(info.stage, "ready")
         self.assertTrue(info.replay)
         self.assertIsNotNone(info.replayed_at)
+        default_info = parse_event(
+            '{"type":"info","subscriptionId":3,"venue":"okx","instrument":"DOGE-USDT-SWAP","stage":"ready","message":"ready"}'
+        )
+        self.assertIsInstance(default_info, InfoEvent)
+        self.assertEqual(default_info.level, "info")
 
         backtest = parse_event(
             '{"type":"backtest","subscriptionId":3,"venue":"okx","instrument":"BASKET:1","timestamp":"2026-05-31T17:00:00Z","backtest":{"accepted":true,"candidate":{"total":0.12}}}'

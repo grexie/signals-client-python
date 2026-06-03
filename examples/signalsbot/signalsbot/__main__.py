@@ -54,7 +54,7 @@ async def main() -> None:
             elif event.type == "withdraw":
                 print(f"withdraw currency={event.currency} amount={event.amount}")
             elif event.type == "info":
-                print(f'info instrument={event.instrument} stage={event.stage} message="{event.message}"')
+                print(f'info level={event.level} instrument={event.instrument} stage={event.stage} message="{event.message}"')
     finally:
         run_task.cancel()
         await client.close()

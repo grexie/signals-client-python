@@ -112,6 +112,7 @@ class InfoEvent:
     subscription_id: int
     venue: str
     instrument: str
+    level: Literal["info", "error", "warn", "debug"]
     stage: str
     message: str
     timestamp: Optional[datetime] = None
@@ -748,7 +749,7 @@ def parse_event(raw: Union[str, bytes, Dict[str, Any]]) -> SignalsEvent:
     if event_type == "order_router_forwarded":
         return OrderRouterForwardedEvent("order_router_forwarded", int(msg.get("subscriptionId", 0)), msg.get("venue"), msg.get("basketId"), msg.get("message"))
     if event_type == "info":
-        return InfoEvent("info", int(msg.get("subscriptionId", 0)), msg.get("venue", ""), msg.get("instrument", ""), msg.get("stage", ""), msg.get("message", ""), _parse_time(msg.get("timestamp")), bool(msg.get("replay", False)), _parse_time(msg.get("replayedAt")))
+        return InfoEvent("info", int(msg.get("subscriptionId", 0)), msg.get("venue", ""), msg.get("instrument", ""), _normalize_info_level(msg.get("level")), msg.get("stage", ""), msg.get("message", ""), _parse_time(msg.get("timestamp")), bool(msg.get("replay", False)), _parse_time(msg.get("replayedAt")))
     if event_type == "backtest":
         payload = msg.get("backtest")
         return BacktestEvent("backtest", int(msg.get("subscriptionId", 0)), msg.get("venue", ""), msg.get("instrument", ""), dict(payload or {}) if isinstance(payload, dict) else {}, _parse_time(msg.get("timestamp")))
@@ -987,6 +988,17 @@ def _positive_or(*values: float) -> float:
 
 def _finite_or(value: float, fallback: float) -> float:
     return value if value == value and value not in (float("inf"), float("-inf")) else fallback
+
+
+def _normalize_info_level(value: Any) -> Literal["info", "error", "warn", "debug"]:
+    level = str(value or "").strip().lower()
+    if level == "error":
+        return "error"
+    if level == "warn":
+        return "warn"
+    if level == "debug":
+        return "debug"
+    return "info"
 
 
 def _parse_time(value: Any) -> Optional[datetime]:
