@@ -142,6 +142,8 @@ class CreateMarketOrderEvent:
     take_profit: float = 0.0
     stop_loss: float = 0.0
     timestamp: Optional[datetime] = None
+    margin: float = 0.0
+    confidence: float = 0.0
 
 
 @dataclass
@@ -221,6 +223,7 @@ class Position:
     trailing_stop_activation: float = 0.0
     trailing_stop_distance: float = 0.0
     trailing_stop_min_profit: float = 0.0
+    margin: float = 0.0
     leverage: float = 1.0
     mfe: float = 0.0
     mae: float = 0.0
@@ -593,7 +596,27 @@ def parse_event(raw: Union[str, bytes, Dict[str, Any]]) -> SignalsEvent:
         signal = _signal_from_payload(payload)
         return SignalEvent("signal", int(msg.get("subscriptionId", 0)), msg.get("venue", signal.venue), msg.get("instrument", signal.instrument), signal, _parse_time(msg.get("timestamp")), bool(msg.get("replay", False)), _parse_time(msg.get("replayedAt")))
     if event_type == "create-market-order":
-        return CreateMarketOrderEvent("create-market-order", int(msg.get("subscriptionId", 0)), msg.get("intentId"), msg.get("action"), msg.get("reason"), msg.get("venue"), msg.get("instrument", ""), msg.get("side", ""), msg.get("orderType"), float(msg.get("contractSize", 0.0) or 0.0), float(msg.get("leverage", 0.0) or 0.0), bool(msg.get("reduceOnly", False)), float(msg.get("takeProfitPrice", 0.0) or 0.0), float(msg.get("stopLossPrice", 0.0) or 0.0), float(msg.get("takeProfit", 0.0) or 0.0), float(msg.get("stopLoss", 0.0) or 0.0), _parse_time(msg.get("timestamp")))
+        return CreateMarketOrderEvent(
+            "create-market-order",
+            int(msg.get("subscriptionId", 0)),
+            msg.get("intentId"),
+            msg.get("action"),
+            msg.get("reason"),
+            msg.get("venue"),
+            msg.get("instrument", ""),
+            msg.get("side", ""),
+            msg.get("orderType"),
+            float(msg.get("contractSize", 0.0) or 0.0),
+            float(msg.get("leverage", 0.0) or 0.0),
+            bool(msg.get("reduceOnly", False)),
+            float(msg.get("takeProfitPrice", 0.0) or 0.0),
+            float(msg.get("stopLossPrice", 0.0) or 0.0),
+            float(msg.get("takeProfit", 0.0) or 0.0),
+            float(msg.get("stopLoss", 0.0) or 0.0),
+            _parse_time(msg.get("timestamp")),
+            float(msg.get("margin", 0.0) or 0.0),
+            float(msg.get("confidence", 0.0) or 0.0),
+        )
     if event_type == "update-tpsl":
         return UpdateTPSLEvent("update-tpsl", int(msg.get("subscriptionId", 0)), msg.get("intentId"), msg.get("venue"), msg.get("instrument", ""), msg.get("side", ""), float(msg.get("takeProfitPrice", 0.0) or 0.0), float(msg.get("stopLossPrice", 0.0) or 0.0), float(msg.get("takeProfit", 0.0) or 0.0), float(msg.get("stopLoss", 0.0) or 0.0), _parse_time(msg.get("timestamp")))
     if event_type == "withdraw":
@@ -644,6 +667,7 @@ def _position_payload(position: Position) -> Dict[str, Any]:
         "size": abs(position.size),
         "entryPrice": position.entry_price,
         "markPrice": position.last_price,
+        "margin": position.margin,
         "leverage": position.leverage,
         "takeProfitPrice": position.take_profit_price,
         "stopLossPrice": position.stop_loss_price,

@@ -42,7 +42,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         client = FakeClient(
             [
                 SubscribedEvent("subscribed", 9, "okx", "BTC-USDT-SWAP"),
-                CreateMarketOrderEvent("create-market-order", 9, "intent_1", "open_position", "entry", "okx", "BTC-USDT-SWAP", "buy", contract_size=3),
+                CreateMarketOrderEvent("create-market-order", 9, "intent_1", "open_position", "entry", "okx", "BTC-USDT-SWAP", "buy", contract_size=3, leverage=1.46, margin=125.5, confidence=0.73),
             ]
         )
         manager = SignalsManager(
@@ -64,6 +64,9 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         intent = await manager.intents.get()
         self.assertEqual(intent.intent_id, "intent_1")
         self.assertEqual(intent.contract_size, 3)
+        self.assertEqual(intent.margin, 125.5)
+        self.assertEqual(intent.leverage, 1.46)
+        self.assertEqual(intent.confidence, 0.73)
 
     async def test_signals_manager_updates_snapshots_after_subscription(self):
         client = FakeClient([])
@@ -114,10 +117,13 @@ class ClientTests(unittest.TestCase):
 
     def test_parse_order_router_events(self):
         order = parse_event(
-            '{"type":"create-market-order","subscriptionId":12,"intentId":"intent_1","reason":"preempted_by_better_route","venue":"okx","instrument":"BTC-USDT-SWAP","side":"buy","contractSize":3}'
+            '{"type":"create-market-order","subscriptionId":12,"intentId":"intent_1","reason":"preempted_by_better_route","venue":"okx","instrument":"BTC-USDT-SWAP","side":"buy","contractSize":3,"margin":125.5,"leverage":1.46,"confidence":0.73}'
         )
         self.assertIsInstance(order, CreateMarketOrderEvent)
         self.assertEqual(order.reason, "preempted_by_better_route")
+        self.assertEqual(order.margin, 125.5)
+        self.assertEqual(order.leverage, 1.46)
+        self.assertEqual(order.confidence, 0.73)
 
         tpsl = parse_event(
             '{"type":"update-tpsl","subscriptionId":12,"intentId":"intent_2","venue":"okx","instrument":"BTC-USDT-SWAP","side":"buy","takeProfitPrice":72100,"stopLossPrice":70050,"takeProfit":0.03,"stopLoss":0.0007}'
