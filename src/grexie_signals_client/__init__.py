@@ -373,13 +373,17 @@ class SignalsClient:
 
         import websockets
 
+        if self.websocket is not None and not getattr(self.websocket, "closed", False):
+            if self._reader_task is not None and not self._reader_task.done():
+                return
         headers = dict(self.headers)
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
-        self.websocket = await websockets.connect(self.url, extra_headers=headers)
+        websocket = await websockets.connect(self.url, extra_headers=headers)
+        self.websocket = websocket
         self._closed = False
         self._terminal_error = None
-        self._reader_task = asyncio.create_task(self._read_loop())
+        self._reader_task = asyncio.create_task(self._read_loop(websocket))
 
     async def close(self) -> None:
         """Close the websocket and stop the background reader task."""
@@ -519,14 +523,14 @@ class SignalsClient:
                 self._subscriber_queues.remove(queue)
 
     async def _send(self, payload: Dict[str, Any]) -> None:
-        if self.websocket is None:
+        if self.websocket is None or getattr(self.websocket, "closed", False):
             raise RuntimeError("signals client is not connected")
         await self.websocket.send(json.dumps(payload, separators=(",", ":"), default=_json_default))
 
-    async def _read_loop(self) -> None:
+    async def _read_loop(self, websocket: Any) -> None:
         try:
-            while self.websocket is not None:
-                raw = await self.websocket.recv()
+            while self.websocket is websocket:
+                raw = await websocket.recv()
                 if _ignored_websocket_message(raw):
                     continue
                 await self._publish(parse_event(raw))
@@ -536,8 +540,10 @@ class SignalsClient:
             self._terminal_error = exc
             await self._publish(exc)
         finally:
-            self._closed = True
-            await self._publish(None)
+            if self.websocket is websocket:
+                self.websocket = None
+                self._closed = True
+                await self._publish(None)
 
     async def _publish(self, item: Any) -> None:
         await self._receive_queue.put(item)
@@ -568,13 +574,31 @@ class SignalsManager:
     async def run(self) -> None:
         """Subscribe, process websocket events until the client stream ends, then unsubscribe."""
 
-        await self.subscribe()
+        backoff = 1.0
         try:
-            async for event in self.client.events():
-                await self.handle_event(event)
+            while True:
+                try:
+                    if self._can_reconnect():
+                        await self.client.connect()
+                    self.subscription_id = 0
+                    await self.subscribe()
+                    async for event in self.client.events():
+                        await self.handle_event(event)
+                    if not self._can_reconnect():
+                        break
+                    backoff = 1.0
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if not self._can_reconnect():
+                        raise
+                self.subscription_id = 0
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
         finally:
             if self.subscription_id > 0:
-                await self.client.unsubscribe(self.subscription_id)
+                with contextlib.suppress(Exception):
+                    await self.client.unsubscribe(self.subscription_id)
                 self.subscription_id = 0
 
     async def subscribe(self) -> None:
@@ -595,14 +619,14 @@ class SignalsManager:
 
         next_asset = self._record_asset(asset)
         if next_asset is not None and self.subscription_id > 0:
-            await self.client.update_asset(self.subscription_id, next_asset)
+            await self._send_live(lambda: self.client.update_asset(self.subscription_id, next_asset))
 
     async def update_position(self, position: Position) -> None:
         """Record and, once subscribed, send a venue position snapshot."""
 
         next_position = self._record_position(position)
         if next_position is not None and self.subscription_id > 0:
-            await self.client.update_position(self.subscription_id, next_position)
+            await self._send_live(lambda: self.client.update_position(self.subscription_id, next_position))
 
     async def add_instrument(self, instrument: str) -> None:
         """Add an instrument locally and to the live subscription."""
@@ -612,7 +636,7 @@ class SignalsManager:
             return
         self.config.instruments = _normalize_instrument_list([*self.config.instruments, instrument])
         if self.subscription_id > 0:
-            await self.client.add_instrument(self.subscription_id, instrument)
+            await self._send_live(lambda: self.client.add_instrument(self.subscription_id, instrument))
 
     async def remove_instrument(self, instrument: str) -> None:
         """Remove an instrument locally and from the live subscription."""
@@ -620,7 +644,7 @@ class SignalsManager:
         instrument = _normalize_instrument(instrument)
         self.config.instruments = [current for current in self.config.instruments if current != instrument]
         if self.subscription_id > 0:
-            await self.client.remove_instrument(self.subscription_id, instrument)
+            await self._send_live(lambda: self.client.remove_instrument(self.subscription_id, instrument))
 
     async def update_config(self, config: Optional[RuntimeInput] = None, **updates: Any) -> None:
         """Apply and optionally send a runtime router config patch."""
@@ -629,7 +653,7 @@ class SignalsManager:
         self.config.risk = _apply_runtime_to_risk(self.config.risk, runtime)
         self.config.profit_withdraw_ratio = runtime.profit_withdraw_ratio
         if self.subscription_id > 0:
-            await self.client.update_config(self.subscription_id, runtime)
+            await self._send_live(lambda: self.client.update_config(self.subscription_id, runtime))
 
     async def schedule_withdrawal(self, *, currency: str, amount: float, venue: str = "", reason: str = "") -> None:
         """Schedule a withdrawal through the live router subscription."""
@@ -646,9 +670,9 @@ class SignalsManager:
         if isinstance(event, SubscribedEvent) and event.subscription_id > 0:
             self.subscription_id = event.subscription_id
             for asset in self.assets():
-                await self.client.update_asset(self.subscription_id, asset)
+                await self._send_live(lambda asset=asset: self.client.update_asset(self.subscription_id, asset))
             for position in self.positions():
-                await self.client.update_position(self.subscription_id, position)
+                await self._send_live(lambda position=position: self.client.update_position(self.subscription_id, position))
         elif isinstance(event, UnsubscribedEvent) and event.subscription_id == self.subscription_id:
             self.subscription_id = 0
         elif isinstance(event, CreateMarketOrderEvent):
@@ -684,6 +708,16 @@ class SignalsManager:
 
         asset = self._assets.get(currency.upper())
         return max(asset.available if asset else 0.0, 0.0) * _clamp01(_positive_or(asset.max_usage if asset else 0.0, 1.0))
+
+    def _can_reconnect(self) -> bool:
+        return callable(getattr(self.client, "connect", None))
+
+    async def _send_live(self, send: Any) -> None:
+        try:
+            await send()
+        except Exception:
+            if not self._can_reconnect():
+                raise
 
     def _record_asset(self, asset: AssetSnapshot) -> Optional[AssetSnapshot]:
         currency = asset.currency.strip().upper()

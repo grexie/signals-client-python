@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import unittest
 
 from grexie_signals_client import (
@@ -84,6 +85,25 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.state().positions[0].status, "open")
         self.assertTrue(any(item["type"] == "update-asset" and item["currency"] == "USDT" for item in client.sent))
         self.assertTrue(any(item["type"] == "update-position" and item["side"] == "sell" and item["size"] == 4 for item in client.sent))
+
+    async def test_signals_manager_silently_reconnects_with_current_state(self):
+        client = ReconnectingFakeClient()
+        manager = SignalsManager(client, config=SignalsManagerConfig(venue="okx", instruments=["BTC-USDT-SWAP"]))
+        task = asyncio.create_task(manager.run())
+
+        await wait_for(lambda: manager.subscription_id == 7)
+        await manager.update_asset(AssetSnapshot("usdt", available=100, equity=100))
+        await manager.update_position(Position("BTC-USDT-SWAP", 2, entry_price=100, last_price=101))
+        client.drop()
+
+        await wait_for(lambda: sum(1 for item in client.sent if item["type"] == "subscribe") >= 2)
+        replay = [item for item in client.sent if item["type"] == "subscribe"][-1]
+        self.assertEqual(replay["assets"][0].currency, "USDT")
+        self.assertEqual(replay["positions"][0].instrument, "BTC-USDT-SWAP")
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 class ClientTests(unittest.TestCase):
@@ -195,6 +215,39 @@ class FakeClient:
 
     async def schedule_withdrawal(self, subscription_id, *, currency, amount, venue="", reason=""):
         self.sent.append({"type": "schedule-withdrawal", "subscriptionId": subscription_id, "currency": currency, "amount": amount, "venue": venue, "reason": reason})
+
+
+class ReconnectingFakeClient(FakeClient):
+    def __init__(self):
+        super().__init__([])
+        self.attempt = 0
+        self.dropped = asyncio.Event()
+        self.connects = 0
+
+    async def connect(self):
+        self.connects += 1
+
+    async def events(self):
+        self.attempt += 1
+        if self.attempt == 1:
+            yield SubscribedEvent("subscribed", 7, "okx", "BTC-USDT-SWAP")
+            await self.dropped.wait()
+            raise RuntimeError("websocket closed")
+        yield SubscribedEvent("subscribed", 8, "okx", "BTC-USDT-SWAP")
+        while True:
+            await asyncio.sleep(0.01)
+
+    def drop(self):
+        self.dropped.set()
+
+
+async def wait_for(predicate, timeout=3.0):
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("timed out waiting for condition")
 
 
 if __name__ == "__main__":
