@@ -57,6 +57,8 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         await manager.run()
 
         self.assertEqual(client.sent[0]["type"], "subscribe")
+        self.assertEqual(client.sent[0]["risk"].max_margin_ratio, 1.0)
+        self.assertEqual(client.sent[0]["risk"].min_lot_haircut_ratio, 0.0)
         self.assertEqual(client.sent[0]["assets"][0].currency, "USDT")
         self.assertEqual(client.sent[0]["positions"][0].instrument, "BTC-USDT-SWAP")
         self.assertTrue(any(item["type"] == "update-asset" and item["subscriptionId"] == 9 for item in client.sent))
@@ -167,8 +169,14 @@ class FakeClient:
     async def remove_instrument(self, subscription_id, instrument):
         self.sent.append({"type": "remove-instrument", "subscriptionId": subscription_id, "instrument": instrument})
 
-    async def update_config(self, subscription_id, *, profit_withdraw_ratio=0):
-        self.sent.append({"type": "update-config", "subscriptionId": subscription_id, "profitWithdrawRatio": profit_withdraw_ratio})
+    async def update_config(self, subscription_id, config=None, **updates):
+        if isinstance(config, dict):
+            payload = config
+        elif config is not None:
+            payload = {"profitWithdrawRatio": getattr(config, "profit_withdraw_ratio", 0.0)}
+        else:
+            payload = updates
+        self.sent.append({"type": "update-config", "subscriptionId": subscription_id, **payload})
 
     async def schedule_withdrawal(self, subscription_id, *, currency, amount, venue="", reason=""):
         self.sent.append({"type": "schedule-withdrawal", "subscriptionId": subscription_id, "currency": currency, "amount": amount, "venue": venue, "reason": reason})

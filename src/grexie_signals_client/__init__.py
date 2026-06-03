@@ -256,11 +256,69 @@ class SignalsManagerState:
 
 
 @dataclass
+class RiskConfig:
+    """Router risk settings sent when subscribing to a basket.
+
+    Args:
+        max_margin_ratio: Fraction of account cash the router may reserve for active positions.
+        min_lot_haircut_ratio: Extra cash buffer applied to lot margin and fees before orders are allowed.
+        max_concurrent_positions: Optional cap on simultaneous active positions; zero leaves it unset.
+        max_drawdown: Optional drawdown guard; zero leaves it unset.
+        switch_buffer: Router score buffer required before switching instruments.
+        min_leverage: Minimum leverage the router may request; zero leaves it unset.
+        max_leverage: Maximum leverage the router may request; zero leaves it unset.
+        profit_withdraw_ratio: Fraction of profits eligible for withdrawal events.
+    """
+
+    max_margin_ratio: float = 1.0
+    min_lot_haircut_ratio: float = 0.0
+    max_concurrent_positions: int = 0
+    max_drawdown: float = 0.0
+    switch_buffer: float = 0.0
+    min_leverage: float = 0.0
+    max_leverage: float = 0.0
+    profit_withdraw_ratio: float = 0.0
+
+
+@dataclass
+class RuntimeConfig:
+    """Router risk patch sent after a basket has subscribed.
+
+    Args mirror :class:`RiskConfig`; zero numeric values mean "no change" for
+    risk fields except ``profit_withdraw_ratio``, which is sent as the current
+    desired ratio.
+    """
+
+    max_margin_ratio: float = 0.0
+    min_lot_haircut_ratio: float = 0.0
+    max_concurrent_positions: int = 0
+    max_drawdown: float = 0.0
+    switch_buffer: float = 0.0
+    min_leverage: float = 0.0
+    max_leverage: float = 0.0
+    profit_withdraw_ratio: float = 0.0
+
+
+RiskInput = Union[RiskConfig, Dict[str, Any]]
+RuntimeInput = Union[RuntimeConfig, Dict[str, Any]]
+
+
+@dataclass
 class SignalsManagerConfig:
+    """Configuration for one server-managed router basket.
+
+    Args:
+        venue: Venue code such as ``"okx"``.
+        instruments: Basket instruments to subscribe and keep in sync.
+        mode: Optional server-side router mode.
+        risk: Initial router risk configuration, as :class:`RiskConfig` or a camelCase dict.
+        profit_withdraw_ratio: Top-level profit withdrawal ratio sent on subscribe.
+    """
+
     venue: str = "okx"
     instruments: List[str] = field(default_factory=list)
     mode: str = ""
-    risk: Dict[str, Any] = field(default_factory=dict)
+    risk: RiskInput = field(default_factory=RiskConfig)
     profit_withdraw_ratio: float = 0.0
 
 
@@ -290,6 +348,8 @@ class SignalsClient:
         self._terminal_error: Optional[BaseException] = None
 
     async def connect(self) -> None:
+        """Open the websocket and start the background reader task."""
+
         import websockets
 
         headers = dict(self.headers)
@@ -301,6 +361,8 @@ class SignalsClient:
         self._reader_task = asyncio.create_task(self._read_loop())
 
     async def close(self) -> None:
+        """Close the websocket and stop the background reader task."""
+
         if self._reader_task is not None:
             self._reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -311,6 +373,13 @@ class SignalsClient:
             self.websocket = None
 
     async def subscribe(self, venue: str, instrument: str) -> None:
+        """Subscribe to a legacy single-instrument stream.
+
+        Args:
+            venue: Venue code.
+            instrument: Instrument symbol.
+        """
+
         await self._send({"type": "subscribe", "venue": venue, "instrument": instrument})
 
     async def subscribe_basket(
@@ -319,16 +388,27 @@ class SignalsClient:
         venue: str,
         instruments: List[str],
         mode: str = "",
-        risk: Optional[Dict[str, Any]] = None,
+        risk: Optional[RiskInput] = None,
         profit_withdraw_ratio: float = 0.0,
         assets: Optional[List[AssetSnapshot]] = None,
         positions: Optional[List[Position]] = None,
     ) -> None:
+        """Subscribe to a server-managed router basket.
+
+        Args:
+            venue: Venue code.
+            instruments: Basket instruments.
+            mode: Optional router mode.
+            risk: Initial router risk settings.
+            profit_withdraw_ratio: Top-level profit withdrawal ratio.
+            assets: Optional current account snapshots to hydrate the router.
+            positions: Optional current position snapshots to hydrate the router.
+        """
+
         payload: Dict[str, Any] = {"type": "subscribe", "venue": venue, "instruments": instruments}
         if mode:
             payload["mode"] = mode
-        if risk:
-            payload["risk"] = risk
+        payload["risk"] = _risk_payload(risk or RiskConfig())
         if profit_withdraw_ratio > 0:
             payload["profitWithdrawRatio"] = profit_withdraw_ratio
         if assets:
@@ -338,30 +418,55 @@ class SignalsClient:
         await self._send(payload)
 
     async def update_asset(self, subscription_id: int, asset: AssetSnapshot) -> None:
+        """Publish an account asset snapshot for a live subscription."""
+
         await self._send({"type": "update-asset", "subscriptionId": subscription_id, **_asset_payload(asset)})
 
     async def update_position(self, subscription_id: int, position: Position) -> None:
+        """Publish a venue position snapshot for a live subscription."""
+
         await self._send({"type": "update-position", "subscriptionId": subscription_id, **_position_payload(position)})
 
     async def add_instrument(self, subscription_id: int, instrument: str) -> None:
+        """Add an instrument to an existing basket subscription."""
+
         await self._send({"type": "add-instrument", "subscriptionId": subscription_id, "instrument": instrument})
 
     async def remove_instrument(self, subscription_id: int, instrument: str) -> None:
+        """Remove an instrument from an existing basket subscription."""
+
         await self._send({"type": "remove-instrument", "subscriptionId": subscription_id, "instrument": instrument})
 
-    async def update_config(self, subscription_id: int, *, profit_withdraw_ratio: float = 0.0) -> None:
-        await self._send({"type": "update-config", "subscriptionId": subscription_id, "profitWithdrawRatio": profit_withdraw_ratio})
+    async def update_config(self, subscription_id: int, config: Optional[RuntimeInput] = None, **updates: Any) -> None:
+        """Send a runtime router config patch.
+
+        Args:
+            subscription_id: Server subscription id.
+            config: RuntimeConfig or dict containing camelCase/snake_case risk fields.
+            **updates: Keyword form of runtime config fields when config is omitted.
+        """
+
+        runtime = _runtime_payload(config if config is not None else updates)
+        await self._send({"type": "update-config", "subscriptionId": subscription_id, **runtime})
 
     async def schedule_withdrawal(self, subscription_id: int, *, currency: str, amount: float, venue: str = "", reason: str = "") -> None:
+        """Schedule a withdrawal request for the router subscription."""
+
         await self._send({"type": "schedule-withdrawal", "subscriptionId": subscription_id, "venue": venue, "currency": currency, "amount": amount, "reason": reason})
 
     async def unsubscribe(self, subscription_id: int) -> None:
+        """Unsubscribe by server subscription id."""
+
         await self._send({"type": "unsubscribe", "subscriptionId": subscription_id})
 
     async def unsubscribe_instrument(self, venue: str, instrument: str) -> None:
+        """Unsubscribe a legacy single-instrument stream."""
+
         await self._send({"type": "unsubscribe", "venue": venue, "instrument": instrument})
 
     async def receive(self) -> SignalsEvent:
+        """Wait for the next typed websocket event."""
+
         if self.websocket is None and self._reader_task is None:
             raise RuntimeError("signals client is not connected")
         item = await self._receive_queue.get()
@@ -372,6 +477,8 @@ class SignalsClient:
         return item
 
     async def events(self) -> AsyncIterator[SignalsEvent]:
+        """Yield an independent stream of typed websocket events."""
+
         if self._terminal_error is not None:
             raise self._terminal_error
         if self._closed:
@@ -435,6 +542,8 @@ class SignalsManager:
             self._record_position(position)
 
     async def run(self) -> None:
+        """Subscribe, process websocket events until the client stream ends, then unsubscribe."""
+
         await self.subscribe()
         try:
             async for event in self.client.events():
@@ -445,6 +554,8 @@ class SignalsManager:
                 self.subscription_id = 0
 
     async def subscribe(self) -> None:
+        """Subscribe the configured basket and send current assets/positions."""
+
         await self.client.subscribe_basket(
             venue=self.config.venue,
             instruments=list(self.config.instruments),
@@ -456,16 +567,22 @@ class SignalsManager:
         )
 
     async def update_asset(self, asset: AssetSnapshot) -> None:
+        """Record and, once subscribed, send an account asset snapshot."""
+
         next_asset = self._record_asset(asset)
         if next_asset is not None and self.subscription_id > 0:
             await self.client.update_asset(self.subscription_id, next_asset)
 
     async def update_position(self, position: Position) -> None:
+        """Record and, once subscribed, send a venue position snapshot."""
+
         next_position = self._record_position(position)
         if next_position is not None and self.subscription_id > 0:
             await self.client.update_position(self.subscription_id, next_position)
 
     async def add_instrument(self, instrument: str) -> None:
+        """Add an instrument locally and to the live subscription."""
+
         instrument = _normalize_instrument(instrument)
         if not instrument:
             return
@@ -474,22 +591,32 @@ class SignalsManager:
             await self.client.add_instrument(self.subscription_id, instrument)
 
     async def remove_instrument(self, instrument: str) -> None:
+        """Remove an instrument locally and from the live subscription."""
+
         instrument = _normalize_instrument(instrument)
         self.config.instruments = [current for current in self.config.instruments if current != instrument]
         if self.subscription_id > 0:
             await self.client.remove_instrument(self.subscription_id, instrument)
 
-    async def update_config(self, *, profit_withdraw_ratio: float = 0.0) -> None:
-        self.config.profit_withdraw_ratio = _clamp01(profit_withdraw_ratio)
+    async def update_config(self, config: Optional[RuntimeInput] = None, **updates: Any) -> None:
+        """Apply and optionally send a runtime router config patch."""
+
+        runtime = _normalize_runtime_config(config if config is not None else updates)
+        self.config.risk = _apply_runtime_to_risk(self.config.risk, runtime)
+        self.config.profit_withdraw_ratio = runtime.profit_withdraw_ratio
         if self.subscription_id > 0:
-            await self.client.update_config(self.subscription_id, profit_withdraw_ratio=self.config.profit_withdraw_ratio)
+            await self.client.update_config(self.subscription_id, runtime)
 
     async def schedule_withdrawal(self, *, currency: str, amount: float, venue: str = "", reason: str = "") -> None:
+        """Schedule a withdrawal through the live router subscription."""
+
         if self.subscription_id <= 0:
             raise RuntimeError("signals manager basket is not subscribed")
         await self.client.schedule_withdrawal(self.subscription_id, currency=currency.upper(), amount=amount, venue=_normalize_venue(venue or self.config.venue), reason=reason)
 
     async def handle_event(self, event: SignalsEvent) -> None:
+        """Apply one typed websocket event to the manager."""
+
         if not self._accepts_event(event):
             return
         if isinstance(event, SubscribedEvent) and event.subscription_id > 0:
@@ -514,15 +641,23 @@ class SignalsManager:
         await self.events_queue.put(event)
 
     def assets(self) -> List[AssetSnapshot]:
+        """Return current asset snapshots sorted by currency."""
+
         return sorted(self._assets.values(), key=lambda asset: asset.currency)
 
     def positions(self) -> List[Position]:
+        """Return current open position snapshots sorted by venue/instrument."""
+
         return sorted(self._positions.values(), key=lambda position: _position_key(position.venue, position.instrument))
 
     def state(self) -> SignalsManagerState:
+        """Return durable state suitable for restart hydration."""
+
         return SignalsManagerState(self.assets(), self.positions())
 
     def available_order_cash(self, currency: str) -> float:
+        """Return available cash after applying the asset max_usage cap."""
+
         asset = self._assets.get(currency.upper())
         return max(asset.available if asset else 0.0, 0.0) * _clamp01(_positive_or(asset.max_usage if asset else 0.0, 1.0))
 
@@ -575,6 +710,8 @@ class SignalsManager:
 
 
 def parse_event(raw: Union[str, bytes, Dict[str, Any]]) -> SignalsEvent:
+    """Parse one raw websocket message into a typed event."""
+
     msg = json.loads(raw.decode() if isinstance(raw, bytes) else raw) if not isinstance(raw, dict) else raw
     event_type = msg.get("type")
     if event_type == "ready":
@@ -674,9 +811,114 @@ def _position_payload(position: Position) -> Dict[str, Any]:
     }
 
 
+def _risk_payload(risk: RiskInput) -> Dict[str, Any]:
+    normalized = _normalize_risk_config(risk)
+    return {
+        "maxMarginRatio": normalized.max_margin_ratio,
+        "minLotHaircutRatio": normalized.min_lot_haircut_ratio,
+        "maxConcurrentPositions": normalized.max_concurrent_positions,
+        "maxDrawdown": normalized.max_drawdown,
+        "switchBuffer": normalized.switch_buffer,
+        "minLeverage": normalized.min_leverage,
+        "maxLeverage": normalized.max_leverage,
+        "profitWithdrawRatio": normalized.profit_withdraw_ratio,
+    }
+
+
+def _runtime_payload(config: RuntimeInput) -> Dict[str, Any]:
+    normalized = _normalize_runtime_config(config)
+    return {
+        "maxMarginRatio": normalized.max_margin_ratio,
+        "minLotHaircutRatio": normalized.min_lot_haircut_ratio,
+        "maxConcurrentPositions": normalized.max_concurrent_positions,
+        "maxDrawdown": normalized.max_drawdown,
+        "switchBuffer": normalized.switch_buffer,
+        "minLeverage": normalized.min_leverage,
+        "maxLeverage": normalized.max_leverage,
+        "profitWithdrawRatio": normalized.profit_withdraw_ratio,
+    }
+
+
+def _normalize_risk_config(risk: RiskInput) -> RiskConfig:
+    if isinstance(risk, RiskConfig):
+        value = risk
+    else:
+        value = RiskConfig(
+            max_margin_ratio=float(risk.get("maxMarginRatio", risk.get("max_margin_ratio", 1.0)) or 0.0),
+            min_lot_haircut_ratio=float(risk.get("minLotHaircutRatio", risk.get("min_lot_haircut_ratio", 0.0)) or 0.0),
+            max_concurrent_positions=int(risk.get("maxConcurrentPositions", risk.get("max_concurrent_positions", 0)) or 0),
+            max_drawdown=float(risk.get("maxDrawdown", risk.get("max_drawdown", 0.0)) or 0.0),
+            switch_buffer=float(risk.get("switchBuffer", risk.get("switch_buffer", 0.0)) or 0.0),
+            min_leverage=float(risk.get("minLeverage", risk.get("min_leverage", 0.0)) or 0.0),
+            max_leverage=float(risk.get("maxLeverage", risk.get("max_leverage", 0.0)) or 0.0),
+            profit_withdraw_ratio=float(risk.get("profitWithdrawRatio", risk.get("profit_withdraw_ratio", 0.0)) or 0.0),
+        )
+    max_leverage = max(0.0, _finite_or(value.max_leverage, 0.0))
+    min_leverage = max(0.0, _finite_or(value.min_leverage, 0.0))
+    if max_leverage > 0 and min_leverage > max_leverage:
+        min_leverage = max_leverage
+    return RiskConfig(
+        max_margin_ratio=_clamp01(_positive_or(_finite_or(value.max_margin_ratio, 0.0), 1.0)),
+        min_lot_haircut_ratio=max(0.0, _finite_or(value.min_lot_haircut_ratio, 0.0)),
+        max_concurrent_positions=max(0, int(value.max_concurrent_positions)),
+        max_drawdown=max(0.0, _finite_or(value.max_drawdown, 0.0)),
+        switch_buffer=max(0.0, _finite_or(value.switch_buffer, 0.0)),
+        min_leverage=min_leverage,
+        max_leverage=max_leverage,
+        profit_withdraw_ratio=_clamp01(value.profit_withdraw_ratio),
+    )
+
+
+def _normalize_runtime_config(config: RuntimeInput) -> RuntimeConfig:
+    if isinstance(config, RuntimeConfig):
+        value = config
+    else:
+        value = RuntimeConfig(
+            max_margin_ratio=float(config.get("maxMarginRatio", config.get("max_margin_ratio", 0.0)) or 0.0),
+            min_lot_haircut_ratio=float(config.get("minLotHaircutRatio", config.get("min_lot_haircut_ratio", 0.0)) or 0.0),
+            max_concurrent_positions=int(config.get("maxConcurrentPositions", config.get("max_concurrent_positions", 0)) or 0),
+            max_drawdown=float(config.get("maxDrawdown", config.get("max_drawdown", 0.0)) or 0.0),
+            switch_buffer=float(config.get("switchBuffer", config.get("switch_buffer", 0.0)) or 0.0),
+            min_leverage=float(config.get("minLeverage", config.get("min_leverage", 0.0)) or 0.0),
+            max_leverage=float(config.get("maxLeverage", config.get("max_leverage", 0.0)) or 0.0),
+            profit_withdraw_ratio=float(config.get("profitWithdrawRatio", config.get("profit_withdraw_ratio", 0.0)) or 0.0),
+        )
+    max_leverage = max(0.0, _finite_or(value.max_leverage, 0.0))
+    min_leverage = max(0.0, _finite_or(value.min_leverage, 0.0))
+    if max_leverage > 0 and min_leverage > max_leverage:
+        min_leverage = max_leverage
+    return RuntimeConfig(
+        max_margin_ratio=_clamp01(value.max_margin_ratio),
+        min_lot_haircut_ratio=max(0.0, _finite_or(value.min_lot_haircut_ratio, 0.0)),
+        max_concurrent_positions=max(0, int(value.max_concurrent_positions)),
+        max_drawdown=max(0.0, _finite_or(value.max_drawdown, 0.0)),
+        switch_buffer=max(0.0, _finite_or(value.switch_buffer, 0.0)),
+        min_leverage=min_leverage,
+        max_leverage=max_leverage,
+        profit_withdraw_ratio=_clamp01(value.profit_withdraw_ratio),
+    )
+
+
+def _apply_runtime_to_risk(risk: RiskInput, config: RuntimeConfig) -> RiskConfig:
+    normalized = _normalize_risk_config(risk)
+    return _normalize_risk_config(
+        RiskConfig(
+            max_margin_ratio=config.max_margin_ratio if config.max_margin_ratio > 0 else normalized.max_margin_ratio,
+            min_lot_haircut_ratio=config.min_lot_haircut_ratio if config.min_lot_haircut_ratio > 0 else normalized.min_lot_haircut_ratio,
+            max_concurrent_positions=config.max_concurrent_positions if config.max_concurrent_positions > 0 else normalized.max_concurrent_positions,
+            max_drawdown=config.max_drawdown if config.max_drawdown > 0 else normalized.max_drawdown,
+            switch_buffer=config.switch_buffer if config.switch_buffer > 0 else normalized.switch_buffer,
+            min_leverage=config.min_leverage if config.min_leverage > 0 else normalized.min_leverage,
+            max_leverage=config.max_leverage if config.max_leverage > 0 else normalized.max_leverage,
+            profit_withdraw_ratio=config.profit_withdraw_ratio,
+        )
+    )
+
+
 def _normalize_manager_config(config: SignalsManagerConfig) -> SignalsManagerConfig:
     config.venue = _normalize_venue(config.venue)
     config.instruments = _normalize_instrument_list(config.instruments)
+    config.risk = _normalize_risk_config(config.risk)
     config.profit_withdraw_ratio = _clamp01(config.profit_withdraw_ratio)
     return config
 
@@ -708,6 +950,10 @@ def _positive_or(*values: float) -> float:
     return 0.0
 
 
+def _finite_or(value: float, fallback: float) -> float:
+    return value if value == value and value not in (float("inf"), float("-inf")) else fallback
+
+
 def _parse_time(value: Any) -> Optional[datetime]:
     if value in (None, ""):
         return None
@@ -731,6 +977,8 @@ __all__ = [
     "Intent",
     "Position",
     "ReadyEvent",
+    "RiskConfig",
+    "RuntimeConfig",
     "Signal",
     "SignalComponent",
     "SignalEvent",
