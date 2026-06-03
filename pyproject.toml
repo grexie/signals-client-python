@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "grexie-signals-client"
 version = "0.1.21"
-description = "Typed Python client for Grexie Signals websocket subscriptions and position management."
+description = "Typed Python client for Grexie Signals websocket subscriptions and router intents."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [{ name = "Grexie" }]
-keywords = ["grexie", "signals", "websocket", "trading", "position-management"]
+keywords = ["grexie", "signals", "websocket", "trading", "router-intents"]
 dependencies = ["websockets>=12"]
 classifiers = [
   "Development Status :: 3 - Alpha",

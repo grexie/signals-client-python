@@ -1,33 +1,24 @@
 import asyncio
-import math
 import unittest
-from datetime import datetime, timedelta, timezone
 
 from grexie_signals_client import (
-    AssetManager,
     AssetSnapshot,
-    InstrumentManager,
-    InstrumentMetadata,
-    InstrumentConfig,
-    CreateMarketOrderEvent,
     BacktestEvent,
-    PositionManager,
+    CreateMarketOrderEvent,
+    ErrorEvent,
+    InfoEvent,
     Position,
     ReadyEvent,
-    Signal,
-    SignalsClient,
     SignalEvent,
-    InfoEvent,
-    ErrorEvent,
+    SignalsClient,
+    SignalsManager,
+    SignalsManagerConfig,
+    SignalsManagerState,
+    SubscribedEvent,
     UpdateTPSLEvent,
     WithdrawEvent,
     parse_event,
-    production_position_manager_config,
 )
-
-
-def order_budget_cost(order):
-    return max(order.margin, 0.0) + max(order.estimated_fee, 0.0)
 
 
 class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
@@ -46,6 +37,46 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await second_event).type, "ready")
         await first.aclose()
         await second.aclose()
+
+    async def test_signals_manager_subscribes_with_state_and_emits_intents(self):
+        client = FakeClient(
+            [
+                SubscribedEvent("subscribed", 9, "okx", "BTC-USDT-SWAP"),
+                CreateMarketOrderEvent("create-market-order", 9, "intent_1", "open_position", "entry", "okx", "BTC-USDT-SWAP", "buy", contract_size=3),
+            ]
+        )
+        manager = SignalsManager(
+            client,
+            SignalsManagerState(
+                assets=[AssetSnapshot("USDT", venue="okx", available=100, equity=100)],
+                positions=[Position("BTC-USDT-SWAP", 2, venue="okx", entry_price=100, last_price=101)],
+            ),
+            SignalsManagerConfig(venue="okx", instruments=["BTC-USDT-SWAP"]),
+        )
+
+        await manager.run()
+
+        self.assertEqual(client.sent[0]["type"], "subscribe")
+        self.assertEqual(client.sent[0]["assets"][0].currency, "USDT")
+        self.assertEqual(client.sent[0]["positions"][0].instrument, "BTC-USDT-SWAP")
+        self.assertTrue(any(item["type"] == "update-asset" and item["subscriptionId"] == 9 for item in client.sent))
+        self.assertTrue(any(item["type"] == "update-position" and item["subscriptionId"] == 9 for item in client.sent))
+        intent = await manager.intents.get()
+        self.assertEqual(intent.intent_id, "intent_1")
+        self.assertEqual(intent.contract_size, 3)
+
+    async def test_signals_manager_updates_snapshots_after_subscription(self):
+        client = FakeClient([])
+        manager = SignalsManager(client, config=SignalsManagerConfig(venue="okx", instruments=["ETH-USDT-SWAP"]))
+        await manager.handle_event(SubscribedEvent("subscribed", 15, "okx", "ETH-USDT-SWAP"))
+
+        await manager.update_asset(AssetSnapshot("usdt", available=50, max_usage=0.5))
+        await manager.update_position(Position("ETH-USDT-SWAP", -4, entry_price=2000))
+
+        self.assertEqual(manager.available_order_cash("USDT"), 25)
+        self.assertEqual(manager.state().positions[0].status, "open")
+        self.assertTrue(any(item["type"] == "update-asset" and item["currency"] == "USDT" for item in client.sent))
+        self.assertTrue(any(item["type"] == "update-position" and item["side"] == "sell" and item["size"] == 4 for item in client.sent))
 
 
 class ClientTests(unittest.TestCase):
@@ -102,554 +133,39 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(withdraw.currency, "USDT")
         self.assertEqual(withdraw.amount, 42)
 
-    def test_position_manager_opens_and_flips(self):
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=0.10,
-                min_expected_edge=0.0,
-                min_order_delta=0.20,
-                flip_flop_window=timedelta(0),
-                max_leverage=5.0,
-            )
-        )
-        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
-        buy = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.8, "buy", 0.02, 0.004, price=100.0, score=0.5)
-        )
-        self.assertEqual(len(buy), 1)
-        self.assertEqual(buy[0].reason, "opening")
-        self.assertAlmostEqual(order_budget_cost(buy[0]), 0.10)
 
-        sell = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.9, "sell", 0.02, 0.004, price=99.0, score=-0.6)
-        )
-        self.assertEqual(len(sell), 1)
-        self.assertEqual(sell[0].side, "sell")
-        self.assertEqual(sell[0].reason, "flip")
-        self.assertAlmostEqual(sell[0].target_size, 0.0)
-        self.assertAlmostEqual(sell[0].size_delta, -buy[0].target_size)
+class FakeClient:
+    def __init__(self, events):
+        self._events = list(events)
+        self.sent = []
 
-        open_short = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.9, "sell", 0.02, 0.004, price=99.0, score=-0.6)
-        )
-        self.assertEqual(len(open_short), 1)
-        self.assertEqual(open_short[0].side, "sell")
-        self.assertEqual(open_short[0].reason, "opening")
+    async def events(self):
+        for event in self._events:
+            yield event
 
-    def test_position_manager_suppresses_flip_flop_by_default(self):
-        start = datetime(2026, 5, 26, tzinfo=timezone.utc)
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=0.10,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-            )
-        )
-        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
-        opened = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.8, "buy", 0.02, 0.004, price=100.0, timestamp=start)
-        )
-        self.assertEqual(len(opened), 1)
-        strong = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.99, "sell", 0.02, 0.004, price=99.95, timestamp=start + timedelta(minutes=5))
-        )
-        self.assertEqual(strong, [])
-        outside_window = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.99, "sell", 0.02, 0.004, price=99.95, timestamp=start + timedelta(minutes=31))
-        )
-        self.assertEqual(len(outside_window), 1)
-        self.assertEqual(outside_window[0].reason, "flip")
+    async def subscribe_basket(self, **request):
+        self.sent.append({"type": "subscribe", **request})
 
-    def test_position_manager_ignores_signals_after_instrument_removed(self):
-        manager = PositionManager(config=production_position_manager_config())
-        manager.assets.update_asset(AssetSnapshot("USDT", available=1000.0, equity=1000.0))
-        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
-        manager.instruments.remove_instrument("okx", "BTC-USDT-SWAP")
-        orders = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.03, 0.01, price=100.0, score=1.0)
-        )
-        self.assertEqual(orders, [])
-        self.assertFalse(manager.instruments.has_instrument("okx", "BTC-USDT-SWAP"))
+    async def unsubscribe(self, subscription_id):
+        self.sent.append({"type": "unsubscribe", "subscriptionId": subscription_id})
 
-    def test_position_manager_allows_explicit_high_confidence_flip_threshold(self):
-        start = datetime(2026, 5, 26, tzinfo=timezone.utc)
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=0.10,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-                flip_flop_window=timedelta(minutes=30),
-                signal_flip_min_confidence=0.72,
-            )
-        )
-        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
-        opened = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.8, "buy", 0.02, 0.004, price=100.0, timestamp=start)
-        )
-        self.assertEqual(len(opened), 1)
-        weak = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.70, "sell", 0.02, 0.004, price=99.95, timestamp=start + timedelta(minutes=5))
-        )
-        self.assertEqual(weak, [])
-        strong = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.72, "sell", 0.02, 0.004, price=99.95, timestamp=start + timedelta(minutes=6))
-        )
-        self.assertEqual(len(strong), 1)
-        self.assertEqual(strong[0].reason, "flip")
+    async def update_asset(self, subscription_id, asset):
+        self.sent.append({"type": "update-asset", "subscriptionId": subscription_id, "currency": asset.currency})
 
-    def test_confidence_is_allocation_weight(self):
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=0.10,
-                min_expected_edge=0.0,
-                min_order_delta=0.20,
-            )
-        )
-        manager.instruments.update_instrument(InstrumentMetadata("okx", "DOGE-USDT-SWAP"))
-        accepted = manager.handle_signal(
-            Signal("okx", "DOGE-USDT-SWAP", 0.15, "buy", 0.02, 0.004, price=0.2)
-        )
-        self.assertEqual(len(accepted), 1)
-        self.assertAlmostEqual(order_budget_cost(accepted[0]), 0.10)
+    async def update_position(self, subscription_id, position):
+        self.sent.append({"type": "update-position", "subscriptionId": subscription_id, "instrument": position.instrument, "side": position.side, "size": abs(position.size)})
 
-    def test_manage_positions_only_does_not_open_or_increase_exposure(self):
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=0.10,
-                min_expected_edge=0.01,
-                min_order_delta=0.0,
-                max_leverage=5.0,
-            )
-        )
-        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
-        blocked_open = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.9, "buy", 0.02, 0.004, price=100.0, manage_positions_only=True)
-        )
-        self.assertEqual(blocked_open, [])
-        self.assertEqual(manager.positions(), [])
+    async def add_instrument(self, subscription_id, instrument):
+        self.sent.append({"type": "add-instrument", "subscriptionId": subscription_id, "instrument": instrument})
 
-        opened = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.7, "buy", 0.02, 0.004, price=100.0)
-        )
-        self.assertEqual(len(opened), 1)
-        self.assertEqual(opened[0].reason, "opening")
+    async def remove_instrument(self, subscription_id, instrument):
+        self.sent.append({"type": "remove-instrument", "subscriptionId": subscription_id, "instrument": instrument})
 
-        same_side = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100.0, manage_positions_only=True)
-        )
-        self.assertEqual(same_side, [])
+    async def update_config(self, subscription_id, *, profit_withdraw_ratio=0):
+        self.sent.append({"type": "update-config", "subscriptionId": subscription_id, "profitWithdrawRatio": profit_withdraw_ratio})
 
-        closed = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.51, "sell", 0.02, 0.004, price=99.0, manage_positions_only=True)
-        )
-        self.assertEqual(len(closed), 1)
-        self.assertEqual(closed[0].reason, "closing")
-        self.assertAlmostEqual(closed[0].target_size, 0.0)
-
-        blocked_short = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.51, "sell", 0.02, 0.004, price=99.0, manage_positions_only=True)
-        )
-        self.assertEqual(blocked_short, [])
-        self.assertEqual(manager.positions(), [])
-
-    def test_quantizes_emitted_target_size_to_executable_lots(self):
-        assets = AssetManager()
-        assets.update_asset(AssetSnapshot("USDT", equity=1000, available=1000))
-        instruments = InstrumentManager()
-        instruments.update_instrument(
-            InstrumentMetadata("okx", "BTC-USDT-SWAP", "USDT", lot_size=1, min_size=1, tick_size=0.1)
-        )
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=0.50,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-                asset_manager=assets,
-                instrument_manager=instruments,
-            )
-        )
-        orders = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.15, "buy", 0.02, 0.004, price=333)
-        )
-        self.assertEqual(len(orders), 1)
-        self.assertEqual(orders[0].quantity, 1)
-        self.assertAlmostEqual(orders[0].size_delta, 1.0)
-        self.assertAlmostEqual(orders[0].target_size, 1.0)
-
-    def test_ignores_unconfigured_signals(self):
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=0.10,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-            )
-        )
-        signal = Signal("okx", "SOL-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
-        self.assertEqual(manager.handle_signal(signal), [])
-        self.assertEqual(manager.positions(), [])
-
-        manager.instruments.update_instrument(InstrumentMetadata("okx", "SOL-USDT-SWAP"))
-        self.assertEqual(len(manager.handle_signal(signal)), 1)
-
-    def test_ignores_replay_signal_events(self):
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=0.10,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-            )
-        )
-        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
-        event = SignalEvent(
-            "signal",
-            3,
-            "okx",
-            "BTC-USDT-SWAP",
-            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100),
-            replay=True,
-        )
-        self.assertEqual(manager.handle_event(event), [])
-        self.assertEqual(manager.positions(), [])
-        event.replay = False
-        self.assertEqual(len(manager.handle_event(event)), 1)
-
-    def test_leverage_adapts_by_confidence_edge_and_score_within_caps(self):
-        def leverage_for(instrument: str, confidence: float, take_profit: float, score: float) -> float:
-            manager = PositionManager(
-                config=production_position_manager_config(
-                    max_margin_ratio=1.0,
-                    min_expected_edge=0.0,
-                    min_order_delta=0.0,
-                    min_leverage=1.0,
-                    max_leverage=5.0,
-                )
-            )
-            manager.instruments.update_instrument(InstrumentMetadata("okx", instrument))
-            orders = manager.handle_signal(
-                Signal("okx", instrument, confidence, "buy", take_profit, 0.0, score=score, price=100)
-            )
-            return orders[0].leverage
-
-        low = leverage_for("LOW-USDT-SWAP", 0.2, 0.0, 0.0)
-        scored = leverage_for("SCORE-USDT-SWAP", 0.2, 0.0, 1.0)
-        high = leverage_for("HIGH-USDT-SWAP", 1.0, 0.02, 1.0)
-        self.assertGreaterEqual(low, 1.0)
-        self.assertLessEqual(high, 5.0)
-        self.assertGreater(scored, low)
-        self.assertAlmostEqual(high, 5.0)
-
-    def test_update_config_keeps_state_and_changes_leverage(self):
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=1.0,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-                rebalance_interval=timedelta(hours=1),
-                flip_flop_window=timedelta(0),
-                min_leverage=5.0,
-                max_leverage=5.0,
-            )
-        )
-        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
-        opening = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, score=1.0, price=100)
-        )
-        self.assertAlmostEqual(opening[0].leverage, 5.0)
-
-        manager.update_config(
-            production_position_manager_config(
-                max_margin_ratio=1.0,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-                rebalance_interval=timedelta(hours=1),
-                flip_flop_window=timedelta(0),
-                min_leverage=1.0,
-                max_leverage=1.0,
-            )
-        )
-        self.assertEqual(len(manager.positions()), 1)
-        closing = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 1.0, "sell", 0.02, 0.004, score=-1.0, price=99)
-        )
-        self.assertTrue(closing[0].reduce_only)
-        self.assertAlmostEqual(closing[0].leverage, 1.0)
-
-    def test_asset_and_instrument_managers_create_concrete_orders(self):
-        assets = AssetManager()
-        assets.update_asset(AssetSnapshot("USDT", cash=1000, available=900, used=100, equity=1000))
-        instruments = InstrumentManager()
-        instruments.update_instrument(
-            InstrumentMetadata("okx", "BTC-USDT-SWAP", "USDT", lot_size=0.001, min_size=0.002, tick_size=0.1, max_leverage=2)
-        )
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=0.10,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-                min_leverage=1.0,
-                max_leverage=5.0,
-                asset_manager=assets,
-                instrument_manager=instruments,
-            )
-        )
-        orders = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100.07)
-        )
-        self.assertEqual(len(orders), 1)
-        self.assertAlmostEqual(orders[0].price, 100.1)
-        self.assertEqual(orders[0].settlement_currency, "USDT")
-        self.assertLessEqual(orders[0].leverage, 2.0)
-        self.assertGreater(orders[0].quantity, 0)
-        self.assertGreater(orders[0].notional, 0)
-        self.assertGreater(orders[0].estimated_fee_value, 0)
-
-    def test_rejects_below_instrument_min_size(self):
-        assets = AssetManager()
-        assets.update_asset(AssetSnapshot("USDT", equity=10))
-        instruments = InstrumentManager()
-        instruments.update_instrument(
-            InstrumentMetadata("okx", "BTC-USDT-SWAP", "USDT", lot_size=0.001, min_size=1, tick_size=0.1)
-        )
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=0.01,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-                asset_manager=assets,
-                instrument_manager=instruments,
-            )
-        )
-        orders = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
-        )
-        self.assertEqual(orders, [])
-
-    def test_phases_reductions_before_openings(self):
-        assets = AssetManager()
-        assets.update_asset(AssetSnapshot("USDT", cash=1000, available=1000, equity=1000))
-        instruments = InstrumentManager()
-        instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP", "USDT"))
-        instruments.update_instrument(InstrumentMetadata("okx", "ETH-USDT-SWAP", "USDT"))
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=0.20,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-                asset_manager=assets,
-                instrument_manager=instruments,
-            )
-        )
-        manager.add_position(
-            Position("okx", "BTC-USDT-SWAP", size=2.0, confidence=1.0, entry_price=100, last_price=100)
-        )
-        reductions = manager.handle_signal(
-            Signal("okx", "ETH-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
-        )
-        self.assertEqual(len(reductions), 1)
-        self.assertEqual(reductions[0].instrument, "BTC-USDT-SWAP")
-        self.assertEqual(reductions[0].side, "sell")
-        expected_btc_target = (100.0 / (1 + reductions[0].leverage * reductions[0].fee_rate)) / reductions[0].price
-        self.assertAlmostEqual(reductions[0].target_size, expected_btc_target)
-
-        openings = manager.handle_signal(
-            Signal("okx", "ETH-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
-        )
-        self.assertEqual(len(openings), 1)
-        self.assertEqual(openings[0].instrument, "ETH-USDT-SWAP")
-        self.assertEqual(openings[0].side, "buy")
-
-    def test_caps_openings_to_available_exposure(self):
-        assets = AssetManager()
-        assets.update_asset(AssetSnapshot("USDT", cash=1000, available=50, equity=1000))
-        instruments = InstrumentManager()
-        instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP", "USDT"))
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=0.20,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-                asset_manager=assets,
-                instrument_manager=instruments,
-            )
-        )
-        orders = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100)
-        )
-        self.assertEqual(len(orders), 1)
-        self.assertLessEqual(order_budget_cost(orders[0]), 50 + 1e-9)
-        self.assertLess(orders[0].margin, 50)
-
-    def test_trailing_stop_closes_after_favorable_giveback(self):
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=1.0,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-            )
-        )
-        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
-        orders = manager.handle_signal(
-            Signal(
-                "okx",
-                "BTC-USDT-SWAP",
-                1.0,
-                "buy",
-                0.50,
-                0.20,
-                trailing_stop_activation=0.02,
-                trailing_stop_distance=0.01,
-                trailing_stop_min_profit=0.001,
-                price=100,
-            )
-        )
-        self.assertEqual(len(orders), 1)
-        self.assertAlmostEqual(orders[0].trailing_stop_activation, 0.02)
-        self.assertEqual(manager.update_price("okx", "BTC-USDT-SWAP", 103), [])
-
-        close = manager.update_price("okx", "BTC-USDT-SWAP", 101.8)
-        self.assertEqual(len(close), 1)
-        self.assertEqual(close[0].reason, "trailing_stop")
-        self.assertEqual(manager.positions(), [])
-        closed = manager.closed_trades()
-        self.assertEqual(len(closed), 1)
-        self.assertEqual(closed[0].exit_reason, "trailing_stop")
-        self.assertGreaterEqual(closed[0].mfe, 0.03 - 1e-9)
-        self.assertGreater(closed[0].realized_pnl, 0)
-
-    def test_persists_and_hydrates_trailing_stop_state(self):
-        snapshots = []
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=1.0,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-                persist=snapshots.append,
-            )
-        )
-        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
-        manager.handle_signal(
-            Signal(
-                "okx",
-                "BTC-USDT-SWAP",
-                1.0,
-                "buy",
-                0.50,
-                0.20,
-                trailing_stop_activation=0.02,
-                trailing_stop_distance=0.01,
-                trailing_stop_min_profit=0.001,
-                price=100,
-            )
-        )
-        manager.update_price("okx", "BTC-USDT-SWAP", 104)
-        latest = snapshots[-1]
-        self.assertEqual(len(latest.positions), 1)
-        self.assertAlmostEqual(latest.positions[0].trailing_stop_activation, 0.02)
-        self.assertGreater(latest.positions[0].mfe, 0.039)
-
-        rehydrated = PositionManager(config=production_position_manager_config(initial_state=latest))
-        self.assertEqual(len(rehydrated.positions()), 1)
-        self.assertEqual(rehydrated.positions()[0].mfe, latest.positions[0].mfe)
-
-    def test_trailing_activation_is_at_least_breakeven(self):
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=1.0,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-                taker_fee_rate=0.0005,
-                instruments={
-                    "okx:BTC-USDT-SWAP": InstrumentConfig(
-                        trailing_stop_activation=0.0001,
-                        trailing_stop_distance=0.01,
-                    )
-                },
-            )
-        )
-        manager.instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP"))
-        orders = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 1.0, "buy", 0.50, 0.20, price=100)
-        )
-
-        self.assertEqual(len(orders), 1)
-        self.assertAlmostEqual(orders[0].trailing_stop_min_profit, 0.001)
-        self.assertAlmostEqual(orders[0].trailing_stop_activation, 0.002)
-
-    def test_caps_openings_to_remaining_portfolio_budget_without_asset_snapshots(self):
-        instruments = InstrumentManager()
-        instruments.update_instrument(InstrumentMetadata("okx", "BTC-USDT-SWAP", "USDT"))
-        instruments.update_instrument(InstrumentMetadata("okx", "ETH-USDT-SWAP", "USDT"))
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=1.0,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-                rebalance_interval=timedelta(hours=6),
-                min_leverage=1.0,
-                max_leverage=1.0,
-                instrument_manager=instruments,
-            )
-        )
-        orders = manager.handle_signal(
-            Signal("okx", "BTC-USDT-SWAP", 0.51, "buy", 0.02, 0.004, price=100, timestamp=datetime(2026, 5, 27, tzinfo=timezone.utc))
-        )
-        self.assertEqual(len(orders), 1)
-        manager.handle_signal(
-            Signal("okx", "ETH-USDT-SWAP", 0.51, "buy", 0.02, 0.004, price=100, timestamp=datetime(2026, 5, 27, 0, 1, tzinfo=timezone.utc))
-        )
-        total = sum(abs(position.size) for position in manager.positions())
-        self.assertLessEqual(total, 0.01 + 1e-9)
-
-    def test_closes_position_below_minimum_position_size_ratio(self):
-        last_signal_at = datetime.now(timezone.utc) - timedelta(minutes=1)
-        assets = AssetManager()
-        assets.update_asset(AssetSnapshot("USDT", cash=1000, available=0.5, used=999.5, equity=1000))
-        instruments = InstrumentManager()
-        instruments.update_instrument(InstrumentMetadata("okx", "DUST-USDT-SWAP", "USDT", lot_size=0.1, min_size=0.1))
-        manager = PositionManager(
-            config=production_position_manager_config(
-                max_margin_ratio=1.0,
-                min_position_size_ratio=0.01,
-                min_expected_edge=0.0,
-                min_order_delta=0.0,
-                rebalance_interval=timedelta(hours=6),
-                asset_manager=assets,
-                instrument_manager=instruments,
-            )
-        )
-        manager.add_position(
-            Position("okx", "DUST-USDT-SWAP", size=0.005, confidence=0.5, entry_price=100, last_price=100, last_signal_at=last_signal_at)
-        )
-
-        orders = manager.handle_signal(
-            Signal("okx", "DUST-USDT-SWAP", 1.0, "buy", 0.02, 0.004, price=100, timestamp=last_signal_at + timedelta(minutes=1))
-        )
-        self.assertEqual(len(orders), 1)
-        self.assertEqual(orders[0].side, "sell")
-        self.assertEqual(orders[0].reason, "closing")
-        self.assertAlmostEqual(orders[0].target_size, 0.0)
-        self.assertAlmostEqual(orders[0].size_delta, -0.005)
-        self.assertAlmostEqual(orders[0].quantity, 0.005)
-
-    def test_stats_by_instrument_and_currency(self):
-        assets = AssetManager()
-        assets.update_asset(AssetSnapshot("USDT", cash=1000, available=800, used=200, equity=1000))
-        instruments = InstrumentManager()
-        instruments.update_instrument(
-            InstrumentMetadata("okx", "ETH-USDT-SWAP", "USDT", lot_size=0.01, min_size=0.01, tick_size=0.01)
-        )
-        manager = PositionManager(
-            config=production_position_manager_config(asset_manager=assets, instrument_manager=instruments)
-        )
-        manager.add_position(
-            Position("okx", "ETH-USDT-SWAP", size=0.10, confidence=0.8, entry_price=100, last_price=110, leverage=2, realized_pnl=0.01, fees=0.001)
-        )
-        stats = manager.stats()
-        self.assertEqual(stats.equity, 1000)
-        self.assertEqual(stats.available, 800)
-        self.assertEqual(stats.by_instrument["okx:ETH-USDT-SWAP"].settlement_currency, "USDT")
-        self.assertGreater(stats.by_instrument["okx:ETH-USDT-SWAP"].quantity, 0)
-        self.assertGreater(stats.total_pnl_percent, 0)
+    async def schedule_withdrawal(self, subscription_id, *, currency, amount, venue="", reason=""):
+        self.sent.append({"type": "schedule-withdrawal", "subscriptionId": subscription_id, "currency": currency, "amount": amount, "venue": venue, "reason": reason})
 
 
 if __name__ == "__main__":
