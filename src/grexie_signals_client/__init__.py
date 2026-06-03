@@ -89,6 +89,24 @@ class UnsubscribedEvent:
 
 
 @dataclass
+class BasketUpdatedEvent:
+    type: Literal["basket_updated"]
+    subscription_id: int
+    venue: Optional[str] = None
+    basket_id: Optional[str] = None
+    message: Optional[str] = None
+
+
+@dataclass
+class OrderRouterForwardedEvent:
+    type: Literal["order_router_forwarded"]
+    subscription_id: int
+    venue: Optional[str] = None
+    basket_id: Optional[str] = None
+    message: Optional[str] = None
+
+
+@dataclass
 class InfoEvent:
     type: Literal["info"]
     subscription_id: int
@@ -183,6 +201,8 @@ SignalsEvent = Union[
     ReadyEvent,
     SubscribedEvent,
     UnsubscribedEvent,
+    BasketUpdatedEvent,
+    OrderRouterForwardedEvent,
     InfoEvent,
     BacktestEvent,
     SignalEvent,
@@ -505,7 +525,10 @@ class SignalsClient:
     async def _read_loop(self) -> None:
         try:
             while self.websocket is not None:
-                await self._publish(parse_event(await self.websocket.recv()))
+                raw = await self.websocket.recv()
+                if _ignored_websocket_message(raw):
+                    continue
+                await self._publish(parse_event(raw))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -720,6 +743,10 @@ def parse_event(raw: Union[str, bytes, Dict[str, Any]]) -> SignalsEvent:
         return SubscribedEvent("subscribed", int(msg.get("subscriptionId", 0)), msg.get("venue", ""), msg.get("instrument", ""))
     if event_type == "unsubscribed":
         return UnsubscribedEvent("unsubscribed", msg.get("subscriptionId"), msg.get("venue"), msg.get("instrument"), msg.get("code"), msg.get("message"))
+    if event_type == "basket_updated":
+        return BasketUpdatedEvent("basket_updated", int(msg.get("subscriptionId", 0)), msg.get("venue"), msg.get("basketId"), msg.get("message"))
+    if event_type == "order_router_forwarded":
+        return OrderRouterForwardedEvent("order_router_forwarded", int(msg.get("subscriptionId", 0)), msg.get("venue"), msg.get("basketId"), msg.get("message"))
     if event_type == "info":
         return InfoEvent("info", int(msg.get("subscriptionId", 0)), msg.get("venue", ""), msg.get("instrument", ""), msg.get("stage", ""), msg.get("message", ""), _parse_time(msg.get("timestamp")), bool(msg.get("replay", False)), _parse_time(msg.get("replayedAt")))
     if event_type == "backtest":
@@ -761,6 +788,14 @@ def parse_event(raw: Union[str, bytes, Dict[str, Any]]) -> SignalsEvent:
     if event_type == "error":
         return ErrorEvent("error", msg.get("code"), msg.get("message"))
     raise ValueError(f"unsupported websocket event type {event_type!r}")
+
+
+def _ignored_websocket_message(raw: Union[str, bytes, Dict[str, Any]]) -> bool:
+    try:
+        msg = json.loads(raw.decode() if isinstance(raw, bytes) else raw) if not isinstance(raw, dict) else raw
+    except Exception:
+        return False
+    return msg.get("type") == "basket_state"
 
 
 def _signal_from_payload(payload: Dict[str, Any]) -> Signal:

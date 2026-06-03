@@ -3,10 +3,12 @@ import unittest
 
 from grexie_signals_client import (
     AssetSnapshot,
+    BasketUpdatedEvent,
     BacktestEvent,
     CreateMarketOrderEvent,
     ErrorEvent,
     InfoEvent,
+    OrderRouterForwardedEvent,
     Position,
     ReadyEvent,
     SignalEvent,
@@ -112,6 +114,13 @@ class ClientTests(unittest.TestCase):
         )
         self.assertIsInstance(backtest, BacktestEvent)
         self.assertTrue(backtest.backtest["accepted"])
+
+        basket_updated = parse_event('{"type":"basket_updated","subscriptionId":12,"venue":"okx","message":"active"}')
+        self.assertIsInstance(basket_updated, BasketUpdatedEvent)
+        self.assertEqual(basket_updated.subscription_id, 12)
+        forwarded = parse_event('{"type":"order_router_forwarded","subscriptionId":12}')
+        self.assertIsInstance(forwarded, OrderRouterForwardedEvent)
+        self.assertEqual(forwarded.subscription_id, 12)
 
         error = parse_event('{"type":"error","code":"forbidden","message":"no access"}')
         self.assertIsInstance(error, ErrorEvent)
